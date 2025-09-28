@@ -201,20 +201,23 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
         original_idx = int(lines[i].strip())
         time_range = lines[i+1].strip()
         j = i + 2
-        lat, lon, alt, tim = None, None, 0.0, ""
+        lat, lon, alt, tim, date_str = None, None, 0.0, "", ""
         
         while j < len(lines) and lines[j].strip():
             line = lines[j]
             if m := re.search(r"\[latitude:\s*([0-9.\-]+)", line): lat = float(m.group(1))
             if m := re.search(r"\[longitude:\s*([0-9.\-]+)", line): lon = float(m.group(1))
             if m := re.search(r"\[altitude:\s*([0-9.\-]+)", line): alt = float(m.group(1))
-            if m := re.search(r"\d{4}-\d{2}-\d{2}\s*([0-9:]{8})", line): tim = m.group(1)
+            # --- MODIFIED to capture date and time separately ---
+            if m := re.search(r"(\d{4}-\d{2}-\d{2})\s*([0-9:]{8})", line):
+                date_str = m.group(1)
+                tim = m.group(2)
             j += 1
             
         if lat is not None and lon is not None:
             blocks.append({
                 'idx': current_idx, 'range': time_range, 'lat': lat, 'lon': lon,
-                'alt': alt, 'tim': tim, 'origin_index': origin_index
+                'alt': alt, 'tim': tim, 'date': date_str, 'origin_index': origin_index
             })
             current_idx += 1
         i = j + 1
@@ -242,7 +245,8 @@ def kml_style_header(num_styles):
         "<?xml version='1.0' encoding='UTF-8'?>\n"
         "\n"
         "<kml xmlns='http://www.opengis.net/kml/2.2'><Document>\n"
-        "<Style id='chainStyle'><LineStyle><color>ff0000ff</color><width>10.0</width></LineStyle></Style>\n"
+        "<name>Chainage Outputs</name>\n"
+        "<Style id='chainStyle'><LineStyle><color>ff0000ff</color><width>4.0</width></LineStyle></Style>\n"
         "<Style id='placemarkStyle'><IconStyle><scale>0.8</scale><Icon><href>http://maps.google.com/mapfiles/ms/icons/red-dot.png</href></Icon></IconStyle></Style>\n"
     )
     styles = []
@@ -256,15 +260,32 @@ def kml_style_header(num_styles):
         )
     return header + "".join(styles)
 
-def generate_markers_kml(coords, cumd, interval_km=0.05):
-    """Generates a KML file with placemarks at a regular interval."""
-    markers, current_dist, idx = [], cumd[0], 0
+# --- NEW: Creates a single, structured KML file ---
+def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_files):
+    """Generates one KML file containing all data in organized folders."""
+    num_styles = len(srt_files)
+    xml = [kml_style_header(num_styles)]
+    
+    # --- Folder 1: User-provided Chainage KML ---
+    xml.append("<Folder><name>Chainage KML</name>")
+    xml.append("<Placemark><name>Original Alignment</name><styleUrl>#chainStyle</styleUrl><LineString><tessellate>1</tessellate><coordinates>")
+    for lat, lon in kml_coords:
+        xml.append(f"{lon:.7f},{lat:.7f},0")
+    xml.append("</coordinates></LineString></Placemark>")
+    xml.append("</Folder>")
+
+    # --- Folder 2: 50m Markers ---
+    xml.append("<Folder><name>markers_50m</name>")
+    coords = kml_coords
+    cumd = kml_chainage_map
+    current_dist = cumd[0]
     total_dist = cumd[-1]
+    interval_km = 0.050
+    idx = 0
     
     while current_dist <= total_dist:
         while idx < len(cumd) - 1 and cumd[idx+1] < current_dist:
             idx += 1
-            
         if idx >= len(coords) - 1: break
         
         A, B = coords[idx], coords[idx+1]
@@ -274,51 +295,49 @@ def generate_markers_kml(coords, cumd, interval_km=0.05):
             fraction = (current_dist - cumd[idx]) / segment_len
             lat = A[0] + fraction * (B[0] - A[0])
             lon = A[1] + fraction * (B[1] - A[1])
-            markers.append((lat, lon, current_dist))
+            xml.append(f"<Placemark><styleUrl>#placemarkStyle</styleUrl><name>{current_dist:.3f} km</name><Point><coordinates>{lon:.7f},{lat:.7f},0</coordinates></Point></Placemark>")
         elif idx == 0 and abs(current_dist - cumd[0]) < 1e-6: # Add start marker
-            markers.append((A[0], A[1], current_dist))
+             xml.append(f"<Placemark><styleUrl>#placemarkStyle</styleUrl><name>{current_dist:.3f} km</name><Point><coordinates>{coords[0][1]:.7f},{coords[0][0]:.7f},0</coordinates></Point></Placemark>")
         
         current_dist += interval_km
+    xml.append("</Folder>")
 
-    xml = [kml_style_header(0)]
-    for lat, lon, d in markers:
-        xml.append(
-            f"<Placemark><styleUrl>#placemarkStyle</styleUrl><name>{d:.3f} km</name>"
-            f"<Point><coordinates>{lon:.7f},{lat:.7f},0</coordinates></Point></Placemark>\n"
-        )
-    xml.append("</Document></kml>")
-    return "".join(xml)
-
-def generate_multi_flight_kml(all_blocks, srt_files):
-    """Generates a KML with a distinct, colored LineString for each SRT file."""
-    xml = [kml_style_header(len(srt_files))]
-    for i in range(len(srt_files)):
-        flight_blocks = [b for b in all_blocks if b['origin_index'] == i]
+    # --- Folder 3: Drone Routes (with sub-folders and start/end points) ---
+    xml.append("<Folder><name>drone_routes</name>")
+    for i, srt_file in enumerate(srt_files):
+        flight_blocks = [b for b in processed_data if b['origin_index'] == i]
         if not flight_blocks: continue
         
-        file_name = srt_files[i].name
-        xml.append(f"<Placemark><name>{file_name}</name><styleUrl>#srtStyle_{i}</styleUrl><LineString><coordinates>\n")
-        for b in flight_blocks:
-            xml.append(f"{b['lon']:.7f},{b['lat']:.7f},{b['alt']:.2f}\n")
-        xml.append("</coordinates></LineString></Placemark>\n")
+        file_name = srt_file.name
+        start_block = flight_blocks[0]
+        end_block = flight_blocks[-1]
         
+        xml.append(f"<Folder><name>{file_name}</name>")
+        # LineString for the flight
+        xml.append(f"<Placemark><name>Route</name><styleUrl>#srtStyle_{i}</styleUrl><LineString><tessellate>1</tessellate><coordinates>")
+        for b in flight_blocks:
+            xml.append(f"{b['lon']:.7f},{b['lat']:.7f},{b['alt']:.2f}")
+        xml.append("</coordinates></LineString></Placemark>")
+        # Start Point Placemark
+        xml.append(f"<Placemark><name>Start: {start_block['chainage']:.3f} km</name><Point><coordinates>{start_block['lon']:.7f},{start_block['lat']:.7f},{start_block['alt']:.2f}</coordinates></Point></Placemark>")
+        # End Point Placemark
+        xml.append(f"<Placemark><name>End: {end_block['chainage']:.3f} km</name><Point><coordinates>{end_block['lon']:.7f},{end_block['lat']:.7f},{end_block['alt']:.2f}</coordinates></Point></Placemark>")
+        xml.append("</Folder>") # Close file_name folder
+    xml.append("</Folder>") # Close drone_routes folder
+    
     xml.append("</Document></kml>")
-    return "".join(xml)
+    return "\n".join(xml)
 
-# --- MODIFIED FOR SINGLE EXPORT BUTTON ---
+# --- MODIFIED FOR SINGLE EXPORT BUTTON and NEW SRT FILE ---
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name):
     """Creates a single ZIP archive containing all output files."""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # 1. Add 50m markers KML to the ZIP
-        markers_kml_data = generate_markers_kml(kml_coords, kml_chainage_map)
-        zf.writestr("markers_50m.kml", markers_kml_data)
+        # 1. Create and add the single, combined KML
+        combined_kml_data = generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_files)
+        zf.writestr("All_Outputs.kml", combined_kml_data)
 
-        # 2. Add drone route KML to the ZIP
-        route_kml_data = generate_multi_flight_kml(processed_data, srt_files)
-        zf.writestr("drone_route.kml", route_kml_data)
-
-        # 3. Add the seven processed SRT files to a subfolder within the ZIP
+        # 2. Add the eight processed SRT files to a subfolder
         prefix = os.path.splitext(kml_name)[0]
         cols = {
             f"{prefix}_01_Latitude.srt": [f"{b['lat']:.7f}" for b in processed_data],
@@ -328,6 +347,7 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
             f"{prefix}_05_LatLonOutput.srt": [f"{b['lat']:.7f}, {b['lon']:.7f}" for b in processed_data],
             f"{prefix}_06_Chainage.srt": [f"{b['chainage']:.3f} km" for b in processed_data],
             f"{prefix}_07_Lateral_Offset.srt": [f"{b['offset']:.3f} m" for b in processed_data],
+            f"{prefix}_08_Date.srt": [b['date'] for b in processed_data], # ADDED DATE FILE
         }
 
         for filename, data_col in cols.items():
@@ -550,7 +570,7 @@ if 'processed_data' in st.session_state:
     # --- MODIFIED: SINGLE DATA EXPORT BUTTON ---
     with st.container(border=True):
         st.subheader("📁 Data Export")
-        st.write("Click the button below to download a single ZIP file containing all outputs: 50m markers KML, drone route KML, and all processed SRT files.")
+        st.write("Click the button below to download a single ZIP file containing all outputs: a structured KML and all processed SRT files.")
 
         zip_buffer = generate_master_zip(
             processed_data,
@@ -570,3 +590,4 @@ if 'processed_data' in st.session_state:
         )
             
     st.balloons()
+
