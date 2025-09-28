@@ -7,11 +7,18 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 
 # --- Dependency Check ---
+# Check for plotting library (Plotly)
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
+# Check for projection libraries (PyProj, Shapely, LXML)
 try:
     from shapely.geometry import LineString, Point
     from pyproj import Proj, Transformer, CRS
@@ -197,13 +204,6 @@ def display_srt_reorder_ui():
 
     st.write("Drag and drop to reorder SRT files for merging. The top file is the start of the merged track.")
 
-    # Create a list of file names for the st.multiselect to manage order
-    ordered_names = [f['name'] for f in st.session_state.srt_files_info]
-    
-    # This is a bit of a hack to get a re-orderable list in Streamlit.
-    # We can use a custom component in a real scenario, but for now this is a workaround
-    # Let's present a simpler up/down button interface.
-
     for i, file_info in enumerate(st.session_state.srt_files_info):
         cols = st.columns([4, 1, 1])
         with cols[0]:
@@ -284,12 +284,18 @@ def display_results():
 
     # Map Preview
     st.subheader("3D Map Preview")
-    fig = generate_3d_plot(
-        results['dataframe'],
-        results['kml_coords'],
-        results['flight_segments']
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    if PLOTLY_AVAILABLE:
+        fig = generate_3d_plot(
+            results['dataframe'],
+            results['kml_coords'],
+            results['flight_segments']
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.error(
+            "**Plotly library not found.** The 3D map preview cannot be displayed. "
+            "To enable this feature, please install the required library by running: `pip install plotly`"
+        )
 
 
 def display_export_options():
@@ -517,7 +523,6 @@ def compute_chainage_pyproj(records: List[SRTRecord], kml_coords: List[Tuple[flo
         dot_p_a_v = np.sum((p_drone_rep - a_points) * segment_vectors, axis=1)
         
         # Avoid division by zero for zero-length segments
-        # np.divide handles this, resulting in inf or nan, which won't be chosen as min
         t = np.divide(dot_p_a_v, dot_v_v, out=np.full_like(dot_v_v, 0), where=dot_v_v!=0)
         t_clamped = np.clip(t, 0, 1)
 
@@ -708,3 +713,4 @@ def generate_kml_output(kml_coords, flight_segments, df) -> str:
 
 if __name__ == "__main__":
     main()
+
