@@ -1,3 +1,5 @@
+# streamlit_app.py
+
 import streamlit as st
 import re
 import math
@@ -5,712 +7,550 @@ import zipfile
 import io
 import xml.etree.ElementTree as ET
 from datetime import datetime
-import pandas as pd
-import numpy as np
-from pathlib import Path
-from typing import List, Dict, Tuple, Any, Optional
-
-# --- Dependency Check ---
-# Check for plotting library (Plotly)
-try:
-    import plotly.graph_objects as go
-    PLOTLY_AVAILABLE = True
-except ImportError:
-    PLOTLY_AVAILABLE = False
-
-# Check for projection libraries (PyProj, Shapely, LXML)
-try:
-    from shapely.geometry import LineString, Point
-    from pyproj import Proj, Transformer, CRS
-    import lxml.etree
-    PROJECTION_LIBS_AVAILABLE = True
-except ImportError:
-    PROJECTION_LIBS_AVAILABLE = False
-
-# --- Constants ---
-KML_NS = {'kml': 'http://www.opengis.net/kml/2.2'}
-CREDIT_LINE = "Creator: Vijay Parmar — for BGol (Community of Surveyors and GIS Experts)"
+import plotly.graph_objects as go
+import os
 
 # ──────────────────────────────────────────────────────────────────────────
-# Data Structures
-# ──────────────────────────────────────────────────────────────────────────
-class SRTRecord(dict):
-    """A dictionary-like object for a single SRT record."""
-    pass
-
-class ChainageResult(dict):
-    """A dictionary-like object for a single chainage result record."""
-    pass
-
-# ──────────────────────────────────────────────────────────────────────────
-# Main App UI
-# ──────────────────────────────────────────────────────────────────────────
-def main():
-    """Main function to run the Streamlit application."""
-    st.set_page_config(page_title="Drone SRT & Chainage", layout="wide")
-    st.title("Drone SRT & Chainage Tool")
-    st.markdown(f"*{CREDIT_LINE}*")
-
-    if not PROJECTION_LIBS_AVAILABLE:
-        st.error(
-            "**Critical libraries missing!** For meter-accurate results, please install `pyproj`, `shapely`, and `lxml`. "
-            "Falling back to less accurate Haversine-based calculations. "
-            "Install with: `pip install pyproj shapely lxml`"
-        )
-
-    # --- Session State Initialization ---
-    if 'srt_files_info' not in st.session_state:
-        st.session_state.srt_files_info = []
-    if 'kml_data' not in st.session_state:
-        st.session_state.kml_data = None
-    if 'computation_results' not in st.session_state:
-        st.session_state.computation_results = None
-    if 'kml_swapped' not in st.session_state:
-        st.session_state.kml_swapped = False
-
-
-    # --- Step 1: File Upload ---
-    st.header("Step 1: Upload Files")
-    col1, col2 = st.columns(2)
-    with col1:
-        uploaded_kml_file = st.file_uploader("Upload Chainage KML (LineString)", type=["kml", "xml"])
-    with col2:
-        uploaded_srt_files = st.file_uploader(
-            "Upload Drone SRT Files", type="srt", accept_multiple_files=True
-        )
-
-    # --- Step 2: KML Configuration ---
-    if uploaded_kml_file:
-        process_kml_upload(uploaded_kml_file)
-
-    # --- Step 3: SRT File Ordering ---
-    if uploaded_srt_files:
-        process_srt_uploads(uploaded_srt_files)
-
-    # --- Step 4: Computation ---
-    st.header("Step 4: Compute Chainage")
-    if st.button("Compute Chainage (Merge & Project)", disabled=not (st.session_state.kml_data and st.session_state.srt_files_info)):
-        with st.spinner("Processing... This may take a moment."):
-            run_computation()
-
-    # --- Step 5 & 6: Results Preview & Export ---
-    if st.session_state.computation_results:
-        display_results()
-        display_export_options()
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# UI Component Functions
+# Author: Vijay Parmar
+# Community: BGol Community of Advanced Surveying and GIS Professionals
+#
+# Description:
+# This Streamlit application processes drone SRT subtitle files against a KML
+# alignment. It has been upgraded to calculate chainage by projecting each drone
+# GPS point onto the KML alignment, providing more accurate stationing and
+# lateral offset data. The UI is designed for a streamlined workflow, handling
+# multiple SRT files, chronological sorting, and comprehensive output generation.
 # ──────────────────────────────────────────────────────────────────────────
 
-def process_kml_upload(kml_file):
-    """Parses the uploaded KML file and displays its properties."""
-    st.header("Step 2: Configure KML Chain")
-    try:
-        kml_name = kml_file.name
-        kml_bytes = kml_file.getvalue()
-        linestrings = parse_kml_linestrings(kml_bytes, kml_name)
+st.set_page_config(page_title="Drone SRT & Chainage v2.0", layout="wide")
 
-        if not linestrings:
-            st.error("No LineString found in the KML file. Please upload a valid KML.")
-            st.session_state.kml_data = None
-            return
+# ──────────────────────────────────────────────────────────────────────────
+# Constants and Session State Initialization
+# ──────────────────────────────────────────────────────────────────────────
 
-        if len(linestrings) > 1:
-            st.warning(f"Found {len(linestrings)} LineStrings. Using the first one.")
+PLOTLY_COLORS = [
+    '#FF0000', '#FFA500', '#008000', '#0000FF', '#4B0082', '#EE82EE', 
+    '#A52A2A', '#00FFFF', '#FF00FF', '#808000'
+] # Red, Orange, Green, Blue, Indigo, Violet, Brown, Cyan, Magenta, Olive
 
-        coords = linestrings[0]
-        if len(coords) < 2:
-            st.error("The KML LineString must have at least 2 vertices.")
-            st.session_state.kml_data = None
-            return
-
-        # Store original coordinates
-        if st.session_state.kml_data is None or st.session_state.kml_data.get('name') != kml_name:
-             st.session_state.kml_data = {
-                 'name': kml_name,
-                 'original_coords': coords,
-                 'swapped': st.session_state.kml_swapped
-             }
-
-        display_kml_info()
-
-    except Exception as e:
-        st.error(f"Error parsing KML file: {e}")
-        st.session_state.kml_data = None
-
-def display_kml_info():
-    """Displays KML info and the swap toggle."""
-    if not st.session_state.kml_data:
-        return
-
-    st.session_state.kml_swapped = st.toggle(
-        "Swap chain start/end direction",
-        value=st.session_state.kml_data.get('swapped', False),
-        key='kml_swap_toggle'
-    )
-    st.session_state.kml_data['swapped'] = st.session_state.kml_swapped
-
-    coords = list(reversed(st.session_state.kml_data['original_coords'])) if st.session_state.kml_swapped else st.session_state.kml_data['original_coords']
-    st.session_state.kml_data['coords'] = coords
-
-    length_km = calculate_linestring_length(coords)
-    st.session_state.kml_data['length_km'] = length_km
-
-    st.info(
-        f"**KML Loaded:**\n"
-        f"- **Vertices:** {len(coords)}\n"
-        f"- **Total Length:** {length_km:.3f} km\n"
-        f"- **Start (Lat, Lon):** {coords[0][0]:.6f}, {coords[0][1]:.6f}\n"
-        f"- **End (Lat, Lon):** {coords[-1][0]:.6f}, {coords[-1][1]:.6f}"
-    )
-
-
-def process_srt_uploads(srt_files):
-    """Parses uploaded SRT files, sorts them, and displays reordering UI."""
-    st.header("Step 3: Order SRT Flights")
-    
-    current_files = {f.name for f in srt_files}
-    previous_files = {f_info['name'] for f_info in st.session_state.srt_files_info}
-
-    if current_files != previous_files:
-        parsed_files = []
-        for srt_file in srt_files:
-            try:
-                records, warnings = parse_srt(srt_file.getvalue(), srt_file.name)
-                if records:
-                    first_timestamp = min(rec['time'] for rec in records if rec.get('time'))
-                    parsed_files.append({
-                        "name": srt_file.name,
-                        "records": records,
-                        "first_timestamp": first_timestamp,
-                        "warnings": warnings,
-                    })
-                else:
-                    st.warning(f"Could not parse any valid records from '{srt_file.name}'.")
-            except Exception as e:
-                st.error(f"Error parsing SRT file '{srt_file.name}': {e}")
-        
-        # Auto-sort by timestamp
-        st.session_state.srt_files_info = sorted(parsed_files, key=lambda x: x['first_timestamp'])
-        
-    display_srt_reorder_ui()
-
-
-def display_srt_reorder_ui():
-    """Renders the UI for reordering SRT files."""
-    if not st.session_state.srt_files_info:
-        return
-
-    st.write("Drag and drop to reorder SRT files for merging. The top file is the start of the merged track.")
-
-    for i, file_info in enumerate(st.session_state.srt_files_info):
-        cols = st.columns([4, 1, 1])
-        with cols[0]:
-            st.text(f"{i+1}. {file_info['name']} (Starts at: {file_info['first_timestamp']})")
-        with cols[1]:
-            if i > 0:
-                if st.button("⬆️", key=f"up_{i}", help="Move Up"):
-                    st.session_state.srt_files_info.insert(i - 1, st.session_state.srt_files_info.pop(i))
-                    st.rerun()
-        with cols[2]:
-            if i < len(st.session_state.srt_files_info) - 1:
-                if st.button("⬇️", key=f"down_{i}", help="Move Down"):
-                    st.session_state.srt_files_info.insert(i + 1, st.session_state.srt_files_info.pop(i))
-                    st.rerun()
-
-    if st.button("Reset to DateTime Order"):
-        st.session_state.srt_files_info = sorted(st.session_state.srt_files_info, key=lambda x: x['first_timestamp'])
-        st.rerun()
-
-
-def run_computation():
-    """Performs the main chainage computation."""
-    kml_coords = st.session_state.kml_data['coords']
-    srt_file_infos = st.session_state.srt_files_info
-
-    # 1. Merge SRT files
-    merged_records = []
-    flight_segments = []
-    start_index = 1
-    warnings = []
-    for file_info in srt_file_infos:
-        records = file_info['records']
-        for rec in records:
-            rec['index'] = start_index
-            start_index += 1
-        merged_records.extend(records)
-        flight_segments.append({
-            'name': file_info['name'],
-            'start_index': records[0]['index'],
-            'end_index': records[-1]['index'],
-            'records': records
-        })
-        warnings.extend(file_info['warnings'])
-
-    # 2. Perform projection and chainage calculation
-    if PROJECTION_LIBS_AVAILABLE:
-        results_df, proj_transformer = compute_chainage_pyproj(merged_records, kml_coords)
-    else:
-        results_df = compute_chainage_fallback(merged_records, kml_coords)
-        proj_transformer = None # No transformer in fallback
-
-    st.session_state.computation_results = {
-        'dataframe': results_df,
-        'flight_segments': flight_segments,
-        'kml_coords': kml_coords,
-        'warnings': warnings,
-        'proj_transformer': proj_transformer
+if 'kml_data' not in st.session_state:
+    st.session_state.kml_data = {
+        "name": None,
+        "coords": None,
+        "swapped": False
     }
-    st.success("Computation complete!")
-
-def display_results():
-    """Displays computation results, including a table and a map."""
-    results = st.session_state.computation_results
-    if not results:
-        return
-
-    st.header("Step 5: Results Preview")
-
-    # Display warnings
-    if results['warnings']:
-        with st.expander("Show Warnings"):
-            for warning in results['warnings']:
-                st.warning(warning)
-    
-    # Table Preview
-    st.subheader("Merged Track Preview")
-    st.dataframe(results['dataframe'].head(20))
-
-    # Map Preview
-    st.subheader("3D Map Preview")
-    if PLOTLY_AVAILABLE:
-        fig = generate_3d_plot(
-            results['dataframe'],
-            results['kml_coords'],
-            results['flight_segments']
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.error(
-            "**Plotly library not found.** The 3D map preview cannot be displayed. "
-            "To enable this feature, please install the required library by running: `pip install plotly`"
-        )
-
-
-def display_export_options():
-    """Displays buttons for downloading all result files."""
-    results = st.session_state.computation_results
-    if not results:
-        return
-
-    st.header("Step 6: Export Results")
-
-    # --- Create files in memory ---
-    df = results['dataframe']
-    flight_segments = results['flight_segments']
-    
-    # Merged files
-    merged_csv_bytes = df.to_csv(index=False).encode('utf-8')
-    merged_srt_bytes = records_to_srt(df.to_dict('records'), use_chainage=True).encode('utf-8')
-
-    # Per-flight files
-    per_flight_files = {}
-    for segment in flight_segments:
-        file_prefix = Path(segment['name']).stem
-        segment_df = df[(df['index'] >= segment['start_index']) & (df['index'] <= segment['end_index'])]
-        
-        per_flight_files[f"{file_prefix}.csv"] = segment_df.to_csv(index=False).encode('utf-8')
-        per_flight_files[f"{file_prefix}.srt"] = records_to_srt(segment_df.to_dict('records'), use_chainage=True).encode('utf-8')
-
-    # KML file
-    kml_bytes = generate_kml_output(
-        results['kml_coords'],
-        flight_segments,
-        df
-    ).encode('utf-8')
-
-    # --- ZIP file ---
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("merged_track.csv", merged_csv_bytes)
-        zf.writestr("merged_track.srt", merged_srt_bytes)
-        zf.writestr("drone_flights.kml", kml_bytes)
-        for name, data in per_flight_files.items():
-            zf.writestr(f"per_flight/{name}", data)
-    zip_buffer.seek(0)
-
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.download_button(
-            label="⬇️ Download All (.zip)",
-            data=zip_buffer,
-            file_name="drone_chainage_results.zip",
-            mime="application/zip",
-        )
-    with col2:
-        st.download_button(
-            label="Download Merged CSV",
-            data=merged_csv_bytes,
-            file_name="merged_track.csv",
-            mime="text/csv",
-        )
-    with col3:
-        st.download_button(
-            label="Download KML",
-            data=kml_bytes,
-            file_name="drone_flights.kml",
-            mime="application/vnd.google-earth.kml+xml",
-        )
+if 'srt_files' not in st.session_state:
+    st.session_state.srt_files = []
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Core Logic Functions
+# Geospatial & Core Logic Helper Functions
 # ──────────────────────────────────────────────────────────────────────────
 
-@st.cache_data
-def parse_kml_linestrings(kml_bytes: bytes, filename: str) -> List[List[Tuple[float, float]]]:
-    """Parses a KML file and extracts all LineString coordinates."""
-    root = ET.fromstring(kml_bytes)
-    all_coords = []
-    for coords_element in root.findall('.//kml:LineString/kml:coordinates', KML_NS):
-        if coords_element.text:
-            coords_list = []
-            parts = coords_element.text.strip().split()
-            for part in parts:
-                try:
-                    lon, lat, *_ = map(float, part.split(','))
-                    coords_list.append((lat, lon))
-                except ValueError:
-                    continue # Skip malformed coordinate tuples
-            if coords_list:
-                all_coords.append(coords_list)
-    return all_coords
+def hav(p1, p2):
+    """Calculates the Haversine distance between two (lat, lon) points in km."""
+    R = 6371.0088  # Mean radius of Earth in km
+    lat1, lon1 = math.radians(p1[0]), math.radians(p1[1])
+    lat2, lon2 = math.radians(p2[0]), math.radians(p2[1])
 
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
 
-@st.cache_data
-def parse_srt(srt_bytes: bytes, filename: str) -> Tuple[List[SRTRecord], List[str]]:
-    """Robustly parses an SRT file using multiple regex patterns."""
-    content = srt_bytes.decode('utf-8', errors='ignore')
-    blocks = content.split('\n\n')
-    records = []
-    warnings = []
-
-    # Case-insensitive regex patterns
-    PATTERNS = {
-        'lat': [re.compile(r'\[latitude[:=]?\s*([\-0-9.]+)', re.IGNORECASE), re.compile(r'lat[:=]?\s*([\-0-9.]+)', re.IGNORECASE)],
-        'lon': [re.compile(r'\[longitude[:=]?\s*([\-0-9.]+)', re.IGNORECASE), re.compile(r'lon[:=]?\s*([\-0-9.]+)', re.IGNORECASE)],
-        'alt': [re.compile(r'\[altitude[:=]?\s*([\-0-9.]+)', re.IGNORECASE), re.compile(r'alt[:=]?\s*([\-0-9.]+)', re.IGNORECASE)],
-        'time': [re.compile(r'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)')],
-        'gps_group': [re.compile(r'GPS:\s*([\-0-9.]+)\s*,\s*([\-0-9.]+)', re.IGNORECASE)]
-    }
-
-    def find_match(key, text):
-        for pattern in PATTERNS[key]:
-            match = pattern.search(text)
-            if match:
-                return match
-        return None
-
-    for block_text in blocks:
-        if not block_text.strip():
-            continue
-
-        lines = block_text.strip().split('\n')
-        if not lines or not lines[0].strip().isdigit():
-            continue
-
-        index = int(lines[0].strip())
-        raw_block = "\n".join(lines)
-        
-        lat, lon, alt, time_obj = None, None, None, None
-
-        # Try combined GPS pattern first
-        gps_match = find_match('gps_group', raw_block)
-        if gps_match:
-            lat = float(gps_match.group(1))
-            lon = float(gps_match.group(2))
-        else:
-            lat_match = find_match('lat', raw_block)
-            lon_match = find_match('lon', raw_block)
-            if lat_match: lat = float(lat_match.group(1))
-            if lon_match: lon = float(lon_match.group(1))
-
-        alt_match = find_match('alt', raw_block)
-        if alt_match: alt = float(alt_match.group(1))
-        
-        time_match = find_match('time', raw_block)
-        if time_match:
-            try:
-                time_str = time_match.group(1).replace(' ', 'T')
-                time_obj = datetime.fromisoformat(time_str)
-            except ValueError:
-                pass
-
-        if lat is not None and lon is not None and time_obj is not None:
-            records.append(SRTRecord({
-                'index': index,
-                'time': time_obj,
-                'lat': lat,
-                'lon': lon,
-                'alt': alt if alt is not None else 0.0,
-                'raw_block': raw_block
-            }))
-        else:
-            warnings.append(f"File '{filename}', Block #{index}: Skipped due to missing lat/lon/timestamp.")
-
-    return records, warnings
-
-
-def haversine_distance(lat1, lon1, lat2, lon2):
-    """Calculates Haversine distance between two points in kilometers."""
-    R = 6371.0088  # Earth radius in kilometers
-    lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
-    lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
-    dlon = lon2_rad - lon1_rad
-    dlat = lat2_rad - lat1_rad
-    a = math.sin(dlat / 2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2)**2
+    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-def calculate_linestring_length(coords: List[Tuple[float, float]]) -> float:
-    """Calculates the total length of a linestring (in km)."""
-    total_length = 0.0
+def calculate_cumulative_dist(coords, offset=0.0):
+    """Calculates the cumulative distance along a list of coordinates."""
+    cum_dist = [offset]
     for i in range(len(coords) - 1):
-        p1 = coords[i]
-        p2 = coords[i+1]
-        total_length += haversine_distance(p1[0], p1[1], p2[0], p2[1])
-    return total_length
+        dist = hav(coords[i], coords[i+1])
+        cum_dist.append(cum_dist[-1] + dist)
+    return cum_dist
 
-
-def compute_chainage_pyproj(records: List[SRTRecord], kml_coords: List[Tuple[float, float]]) -> Tuple[pd.DataFrame, Transformer]:
-    """Computes chainage using pyproj for accurate projection."""
-    # 1. Set up projection
-    kml_coords_arr = np.array(kml_coords)
-    centroid = kml_coords_arr.mean(axis=0)
+@st.cache_data
+def project_point_to_polyline(point, polyline_coords, polyline_chainage):
+    """
+    Finds the closest point on a polyline to a given point.
     
-    aeqd_proj = CRS(f"+proj=aeqd +lat_0={centroid[0]} +lon_0={centroid[1]} +datum=WGS84")
-    transformer = Transformer.from_crs("EPSG:4326", aeqd_proj, always_xy=True)
-
-    # 2. Project KML chain and drone points to planar coordinates (meters)
-    kml_lon, kml_lat = kml_coords_arr[:, 1], kml_coords_arr[:, 0]
-    proj_kml_x, proj_kml_y = transformer.transform(kml_lon, kml_lat)
-    proj_kml_points = np.column_stack([proj_kml_x, proj_kml_y])
-
-    drone_lons = np.array([r['lon'] for r in records])
-    drone_lats = np.array([r['lat'] for r in records])
-    proj_drone_x, proj_drone_y = transformer.transform(drone_lons, drone_lats)
-    proj_drone_points = np.column_stack([proj_drone_x, proj_drone_y])
-
-    # 3. Precompute chain segment data
-    segment_vectors = np.diff(proj_kml_points, axis=0)
-    segment_lengths = np.linalg.norm(segment_vectors, axis=1)
-    cumulative_lengths = np.concatenate(([0], np.cumsum(segment_lengths)))
-
-    results = []
-    # 4. For each drone point, find the closest projection on the chain
-    for p_drone in proj_drone_points:
-        min_dist = float('inf')
-        best_chainage = 0.0
-        
-        # Calculate projection onto all segments and find the minimum distance
-        p_drone_rep = np.tile(p_drone, (len(segment_vectors), 1))
-        a_points = proj_kml_points[:-1]
-        
-        # Vectorized projection calculation
-        dot_v_v = np.sum(segment_vectors * segment_vectors, axis=1)
-        dot_p_a_v = np.sum((p_drone_rep - a_points) * segment_vectors, axis=1)
-        
-        # Avoid division by zero for zero-length segments
-        t = np.divide(dot_p_a_v, dot_v_v, out=np.full_like(dot_v_v, 0), where=dot_v_v!=0)
-        t_clamped = np.clip(t, 0, 1)
-
-        projected_points = a_points + (segment_vectors * t_clamped[:, np.newaxis])
-        distances = np.linalg.norm(p_drone_rep - projected_points, axis=1)
-        
-        # Find the segment with the minimum distance
-        best_segment_idx = np.argmin(distances)
-        
-        min_dist = distances[best_segment_idx]
-        best_t = t_clamped[best_segment_idx]
-        
-        chainage_m = cumulative_lengths[best_segment_idx] + best_t * segment_lengths[best_segment_idx]
-        
-        results.append({
-            'chainage_km': chainage_m / 1000.0,
-            'distance_to_chain_m': min_dist
-        })
-        
-    df = pd.DataFrame(records)
-    results_df = pd.DataFrame(results)
-    final_df = pd.concat([df, results_df], axis=1)
+    Returns:
+        - projected_chainage (km)
+        - projected_coords (lat, lon)
+        - offset_distance (m)
+    """
+    min_dist_sq = float('inf')
+    best_proj_point = None
+    best_segment_idx = -1
     
-    # Formatting
-    final_df['chainage_km'] = final_df['chainage_km'].map('{:.3f}'.format)
-    final_df['distance_to_chain_m'] = final_df['distance_to_chain_m'].map('{:.2f}'.format)
-    final_df['timestamp'] = final_df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    # Use an equirectangular projection for a fast approximation to find the nearest segment.
+    # This is much faster than doing complex spherical geometry for every segment.
+    avg_lat_rad = math.radians(point[0])
+    cos_avg_lat = math.cos(avg_lat_rad)
+    px, py = point[1] * cos_avg_lat, point[0]
 
-    return final_df[['index', 'timestamp', 'lat', 'lon', 'alt', 'chainage_km', 'distance_to_chain_m']], transformer
-
-
-def compute_chainage_fallback(records: List[SRTRecord], kml_coords: List[Tuple[float, float]]) -> pd.DataFrame:
-    """Fallback chainage computation using Haversine (less accurate)."""
-    # Precompute cumulative distance along the chain
-    cum_dist_km = [0.0]
-    for i in range(len(kml_coords) - 1):
-        p1 = kml_coords[i]
-        p2 = kml_coords[i+1]
-        cum_dist_km.append(cum_dist_km[-1] + haversine_distance(p1[0], p1[1], p2[0], p2[1]))
-
-    results = []
-    for rec in records:
-        # Find the closest vertex on the chain (this is the approximation)
-        drone_point = (rec['lat'], rec['lon'])
-        distances_to_vertices = [haversine_distance(drone_point[0], drone_point[1], v[0], v[1]) for v in kml_coords]
-        closest_vertex_idx = np.argmin(distances_to_vertices)
+    for i in range(len(polyline_coords) - 1):
+        a = polyline_coords[i]
+        b = polyline_coords[i+1]
         
-        chainage_km = cum_dist_km[closest_vertex_idx]
-        distance_to_chain_m = distances_to_vertices[closest_vertex_idx] * 1000
+        ax, ay = a[1] * cos_avg_lat, a[0]
+        bx, by = b[1] * cos_avg_lat, b[0]
 
-        results.append({
-            'chainage_km': f"{chainage_km:.3f}",
-            'distance_to_chain_m': f"{distance_to_chain_m:.2f}"
-        })
-
-    df = pd.DataFrame(records)
-    results_df = pd.DataFrame(results)
-    final_df = pd.concat([df, results_df], axis=1)
-    final_df['timestamp'] = final_df['time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-    return final_df[['index', 'timestamp', 'lat', 'lon', 'alt', 'chainage_km', 'distance_to_chain_m']]
-
-
-def generate_3d_plot(df: pd.DataFrame, kml_coords: List[Tuple[float, float]], flight_segments: List[Dict]) -> go.Figure:
-    """Generates a 3D Plotly figure for visualization."""
-    fig = go.Figure()
-
-    # Plot Chain Polyline
-    kml_arr = np.array(kml_coords)
-    fig.add_trace(go.Scatter3d(
-        x=kml_arr[:, 1], y=kml_arr[:, 0], z=np.zeros(len(kml_arr)),
-        mode='lines',
-        line=dict(color='blue', width=8),
-        name='Chain Polyline'
-    ))
-
-    # Plot each flight segment with a different color
-    colors = ['red', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 'brown', 'pink', 'olive', 'gray', 'lime']
-    for i, segment in enumerate(flight_segments):
-        segment_df = df[(df['index'] >= segment['start_index']) & (df['index'] <= segment['end_index'])]
-        color = colors[i % len(colors)]
+        apx, apy = px - ax, py - ay
+        abx, aby = bx - ax, by - ay
         
-        # Flight path
-        fig.add_trace(go.Scatter3d(
-            x=segment_df['lon'], y=segment_df['lat'], z=segment_df['alt'],
-            mode='lines',
-            line=dict(color=color, width=4),
-            name=f"Flight: {Path(segment['name']).stem}"
-        ))
-
-        # Start/End markers
-        start_row = segment_df.iloc[0]
-        end_row = segment_df.iloc[-1]
-        fig.add_trace(go.Scatter3d(
-            x=[start_row['lon'], end_row['lon']], y=[start_row['lat'], end_row['lat']], z=[start_row['alt'], end_row['alt']],
-            mode='markers+text',
-            marker=dict(size=5, color=color, symbol='diamond'),
-            text=[f"START: {start_row['chainage_km']} km", f"END: {end_row['chainage_km']} km"],
-            textposition="top center",
-            name=f"Markers: {Path(segment['name']).stem}"
-        ))
-
-    fig.update_layout(
-        title="3D View of Drone Flights and Chainage",
-        scene=dict(
-            xaxis_title='Longitude',
-            yaxis_title='Latitude',
-            zaxis_title='Altitude (m)',
-            aspectmode='data' # This makes the aspect ratio realistic
-        ),
-        margin=dict(l=0, r=0, b=0, t=40),
-        height=600
-    )
-    return fig
-
-
-def records_to_srt(records: List[Dict], use_chainage=False) -> str:
-    """Converts a list of records back to SRT format."""
-    srt_blocks = []
-    for i, rec in enumerate(records):
-        start_time = f"00:00:{i:02d},000"
-        end_time = f"00:00:{i+1:02d},000"
-        
-        if use_chainage:
-            content = f"Chainage: {rec['chainage_km']} km | Dist: {rec['distance_to_chain_m']} m\n" \
-                      f"Lat: {rec['lat']:.6f}, Lon: {rec['lon']:.6f}, Alt: {rec['alt']:.2f}"
+        ab_mag_sq = abx**2 + aby**2
+        if ab_mag_sq == 0:
+            t = 0
         else:
-            content = f"Lat: {rec['lat']:.6f}, Lon: {rec['lon']:.6f}, Alt: {rec['alt']:.2f}"
+            t = (apx * abx + apy * aby) / ab_mag_sq
 
-        srt_blocks.append(f"{rec['index']}\n{start_time} --> {end_time}\n{content}")
-    return "\n\n".join(srt_blocks)
-
-
-def generate_kml_output(kml_coords, flight_segments, df) -> str:
-    """Generates the final KML file with multiple colored flight paths."""
-    
-    # Color palette
-    colors = ['ff0000ff', 'ff00ff00', 'ff00a5ff', 'ffff0000', 'ff00ffff', 'ffff00ff', 'ffffff00', 'ff458b00', 'ffe6e6fa', 'ff2e8b57', 'ffa020f0', 'ff00ced1'] # Red, Green, Orange, Blue, Cyan, Magenta, etc. (AABBGGRR format)
-
-    # KML Document Start
-    kml = [
-        "<?xml version='1.0' encoding='UTF-8'?>",
-        f"<!-- {CREDIT_LINE} -->",
-        f"<kml xmlns='{KML_NS['kml']}'>",
-        "<Document>",
-        f"<name>Drone Flight Chainage</name>",
-        f"<description>{CREDIT_LINE}</description>"
-    ]
-    
-    # Styles
-    kml.append("<Style id='chainStyle'><LineStyle><color>ff00ffff</color><width>4</width></LineStyle></Style>") # Yellow for chain
-    for i in range(len(flight_segments)):
-        color = colors[i % len(colors)]
-        kml.append(f"<Style id='flightStyle_{i}'><LineStyle><color>{color}</color><width>3</width></LineStyle></Style>")
-
-    # Chain Placemark
-    kml.append("<Folder><name>Chain Polyline</name>")
-    kml.append("<Placemark><name>Chain</name><styleUrl>#chainStyle</styleUrl><LineString><coordinates>")
-    kml.append(" ".join([f"{lon:.6f},{lat:.6f},0" for lat, lon in kml_coords]))
-    kml.append("</coordinates></LineString></Placemark>")
-    kml.append("</Folder>")
-
-    # Flight Placemarks
-    kml.append("<Folder><name>Drone Flights</name>")
-    for i, segment in enumerate(flight_segments):
-        segment_df = df[(df['index'] >= segment['start_index']) & (df['index'] <= segment['end_index'])]
-        file_stem = Path(segment['name']).stem
+        if t < 0:
+            proj_x, proj_y = ax, ay
+        elif t > 1:
+            proj_x, proj_y = bx, by
+        else:
+            proj_x, proj_y = ax + t * abx, ay + t * aby
         
-        kml.append(f"<Folder><name>{file_stem}</name>")
-        # LineString for the flight
-        kml.append(f"<Placemark><name>{file_stem}</name><styleUrl>#flightStyle_{i}</styleUrl><LineString><coordinates>")
-        kml.append(" ".join([f"{row['lon']:.6f},{row['lat']:.6f},{row['alt']:.2f}" for _, row in segment_df.iterrows()]))
-        kml.append("</coordinates></LineString></Placemark>")
+        dist_sq = (px - proj_x)**2 + (py - proj_y)**2
+        if dist_sq < min_dist_sq:
+            min_dist_sq = dist_sq
+            best_proj_point = (proj_y, proj_x / cos_avg_lat)
+            best_segment_idx = i
 
-        # Start/End Placemarks
-        start_row = segment_df.iloc[0]
-        end_row = segment_df.iloc[-1]
-        kml.append(f"<Placemark><name>START: {start_row['chainage_km']} km</name><Point><coordinates>{start_row['lon']:.6f},{start_row['lat']:.6f},{start_row['alt']:.2f}</coordinates></Point></Placemark>")
-        kml.append(f"<Placemark><name>END: {end_row['chainage_km']} km</name><Point><coordinates>{end_row['lon']:.6f},{end_row['lat']:.6f},{end_row['alt']:.2f}</coordinates></Point></Placemark>")
-        kml.append("</Folder>")
-
-    kml.append("</Folder>")
+    # Perform accurate Haversine calculations for the final result
+    offset_dist_km = hav(point, best_proj_point)
+    start_of_segment = polyline_coords[best_segment_idx]
+    dist_along_segment_km = hav(start_of_segment, best_proj_point)
     
-    # KML Document End
-    kml.append("</Document></kml>")
-    return "\n".join(kml)
+    projected_chainage = polyline_chainage[best_segment_idx] + dist_along_segment_km
+
+    return projected_chainage, best_proj_point, offset_dist_km * 1000
+
+# ──────────────────────────────────────────────────────────────────────────
+# File Parsing and Data Handling Functions
+# ──────────────────────────────────────────────────────────────────────────
+
+@st.cache_data
+def parse_kml_2d(uploaded_file):
+    """Parses a KML file to extract the first LineString coordinates."""
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    file_content = uploaded_file.getvalue()
+    # Reset buffer position for potential reuse
+    uploaded_file.seek(0)
+    tree = ET.parse(io.BytesIO(file_content))
+    
+    coord_element = tree.find('.//kml:LineString/kml:coordinates', ns)
+    if coord_element is None:
+        st.error("Could not find a LineString in the KML file.")
+        return []
+        
+    coords = []
+    for part in coord_element.text.strip().split():
+        try:
+            lon, lat, *_ = part.split(',')
+            coords.append((float(lat), float(lon)))
+        except ValueError:
+            continue # Skip malformed coordinate pairs
+    return coords
+
+@st.cache_data
+def get_srt_start_time(uploaded_file):
+    """Efficiently reads the first timestamp from an SRT file."""
+    try:
+        content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
+        uploaded_file.seek(0) # Reset buffer
+        match = re.search(r"(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})", content)
+        if match:
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+    return None
+
+def parse_srt(file_content_str, origin_index, start_idx=1):
+    """Parses a single SRT file's content into a list of data blocks."""
+    lines = file_content_str.splitlines()
+    blocks, i = [], 0
+    current_idx = start_idx
+    
+    while i < len(lines):
+        if not lines[i].strip().isdigit():
+            i += 1
+            continue
+        
+        original_idx = int(lines[i].strip())
+        time_range = lines[i+1].strip()
+        j = i + 2
+        lat, lon, alt, tim = None, None, 0.0, ""
+        
+        while j < len(lines) and lines[j].strip():
+            line = lines[j]
+            if m := re.search(r"\[latitude:\s*([0-9.\-]+)", line): lat = float(m.group(1))
+            if m := re.search(r"\[longitude:\s*([0-9.\-]+)", line): lon = float(m.group(1))
+            if m := re.search(r"\[altitude:\s*([0-9.\-]+)", line): alt = float(m.group(1))
+            if m := re.search(r"\d{4}-\d{2}-\d{2}\s*([0-9:]{8})", line): tim = m.group(1)
+            j += 1
+            
+        if lat is not None and lon is not None:
+            blocks.append({
+                'idx': current_idx, 'range': time_range, 'lat': lat, 'lon': lon,
+                'alt': alt, 'tim': tim, 'origin_index': origin_index
+            })
+            current_idx += 1
+        i = j + 1
+    return blocks
+
+def merge_srt_data(sorted_files):
+    """Merges multiple SRT files into a single chronological list of blocks."""
+    all_blocks = []
+    start_idx = 1
+    for i, file in enumerate(sorted_files):
+        content = file.getvalue().decode('utf-8', errors='ignore')
+        file.seek(0)
+        blocks = parse_srt(content, origin_index=i, start_idx=start_idx)
+        all_blocks.extend(blocks)
+        start_idx = len(all_blocks) + 1
+    return all_blocks
+
+# ──────────────────────────────────────────────────────────────────────────
+# KML and ZIP Generation Functions
+# ──────────────────────────────────────────────────────────────────────────
+
+def kml_style_header(num_styles):
+    """Generates KML styles for multiple drone paths."""
+    header = (
+        "<?xml version='1.0' encoding='UTF-8'?>\n"
+        "\n"
+        "<kml xmlns='http://www.opengis.net/kml/2.2'><Document>\n"
+        "<Style id='chainStyle'><LineStyle><color>ff0000ff</color><width>10.0</width></LineStyle></Style>\n"
+        "<Style id='placemarkStyle'><IconStyle><scale>0.8</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/wht-blank.png</href></Icon></IconStyle></Style>\n"
+    )
+    styles = []
+    for i in range(num_styles):
+        color_bgr = PLOTLY_COLORS[i % len(PLOTLY_COLORS)].replace('#', '')
+        color_abgr = f"ff{color_bgr[4:6]}{color_bgr[2:4]}{color_bgr[0:2]}" # #RRGGBB -> aabbggrr
+        styles.append(
+            f"<Style id='srtStyle_{i}'>"
+            f"<LineStyle><color>{color_abgr}</color><width>4.0</width></LineStyle>"
+            f"</Style>\n"
+        )
+    return header + "".join(styles)
+
+def generate_markers_kml(coords, cumd, interval_km=0.05):
+    """Generates a KML file with placemarks at a regular interval."""
+    markers, current_dist, idx = [], cumd[0], 0
+    total_dist = cumd[-1]
+    
+    while current_dist <= total_dist:
+        while idx < len(cumd) - 1 and cumd[idx+1] < current_dist:
+            idx += 1
+            
+        if idx >= len(coords) - 1: break
+        
+        A, B = coords[idx], coords[idx+1]
+        segment_len = cumd[idx+1] - cumd[idx]
+        
+        if segment_len > 0:
+            fraction = (current_dist - cumd[idx]) / segment_len
+            lat = A[0] + fraction * (B[0] - A[0])
+            lon = A[1] + fraction * (B[1] - A[1])
+            markers.append((lat, lon, current_dist))
+        elif idx == 0 and current_dist == cumd[0]: # Add start marker
+            markers.append((A[0], A[1], current_dist))
+        
+        current_dist += interval_km
+
+    xml = [kml_style_header(0)]
+    for lat, lon, d in markers:
+        xml.append(
+            f"<Placemark><styleUrl>#placemarkStyle</styleUrl><name>{d:.3f} km</name>"
+            f"<Point><coordinates>{lon:.7f},{lat:.7f},0</coordinates></Point></Placemark>\n"
+        )
+    xml.append("</Document></kml>")
+    return "".join(xml)
+
+def generate_multi_flight_kml(all_blocks, srt_files):
+    """Generates a KML with a distinct, colored LineString for each SRT file."""
+    xml = [kml_style_header(len(srt_files))]
+    for i in range(len(srt_files)):
+        flight_blocks = [b for b in all_blocks if b['origin_index'] == i]
+        if not flight_blocks: continue
+        
+        file_name = srt_files[i].name
+        xml.append(f"<Placemark><name>{file_name}</name><styleUrl>#srtStyle_{i}</styleUrl><LineString><coordinates>\n")
+        for b in flight_blocks:
+            xml.append(f"{b['lon']:.7f},{b['lat']:.7f},{b['alt']:.2f}\n")
+        xml.append("</coordinates></LineString></Placemark>\n")
+        
+    xml.append("</Document></kml>")
+    return "".join(xml)
+
+def generate_output_zip(processed_data, kml_name):
+    """Creates a ZIP archive with seven processed SRT output files."""
+    prefix = os.path.splitext(kml_name)[0]
+    
+    # Prepare data columns
+    cols = {
+        f"{prefix}_01_Latitude.srt": [f"{b['lat']:.7f}" for b in processed_data],
+        f"{prefix}_02_Longitude.srt": [f"{b['lon']:.7f}" for b in processed_data],
+        f"{prefix}_03_Altitude.srt": [f"{b['alt']:.2f}" for b in processed_data],
+        f"{prefix}_04_Timer.srt": [b['tim'] for b in processed_data],
+        f"{prefix}_05_LatLonOutput.srt": [f"{b['lat']:.7f}, {b['lon']:.7f}" for b in processed_data],
+        f"{prefix}_06_Chainage.srt": [f"{b['chainage']:.3f} km" for b in processed_data],
+        f"{prefix}_07_Lateral_Offset.srt": [f"{b['offset']:.3f} m" for b in processed_data],
+    }
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for filename, data_col in cols.items():
+            srt_content = "\n\n".join(
+                f"{processed_data[i]['idx']}\n{processed_data[i]['range']}\n{data_col[i]}"
+                for i in range(len(processed_data))
+            )
+            zf.writestr(filename, srt_content)
+            
+    zip_buffer.seek(0)
+    return zip_buffer
+
+# ──────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ──────────────────────────────────────────────────────────────────────────
+
+st.title("🛰️ Drone SRT & Chainage Workflow v2.0")
+st.markdown(
+    """**Author:** Vijay Parmar  
+**Community:** BGol Community of Advanced Surveying and GIS Professionals"""
+)
+st.markdown("---")
 
 
-if __name__ == "__main__":
-    main()
+# --------------------------
+# Section 1: Setup & Inputs
+# --------------------------
+st.header("Section 1: Setup & Inputs")
 
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Step 1: Upload KML Alignment")
+    uploaded_kml = st.file_uploader("Upload your master alignment KML file", type=["kml", "xml"])
+
+with col2:
+    st.subheader("Step 2: Upload Drone SRT Files")
+    uploaded_srts = st.file_uploader(
+        "Upload one or more drone .SRT files",
+        type="srt",
+        accept_multiple_files=True
+    )
+
+# --- KML Configuration UI ---
+if uploaded_kml:
+    if st.session_state.kml_data["name"] != uploaded_kml.name:
+        coords = parse_kml_2d(uploaded_kml)
+        if coords:
+            st.session_state.kml_data = {
+                "name": uploaded_kml.name,
+                "coords": coords,
+                "swapped": False
+            }
+        else:
+            st.session_state.kml_data = {"name": None, "coords": None, "swapped": False}
+
+    if st.session_state.kml_data["coords"]:
+        with st.container(border=True):
+            st.subheader("KML Alignment Configuration")
+            
+            kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
+            total_length = calculate_cumulative_dist(kml_coords)[-1]
+
+            st.info(f"**Total Alignment Length:** `{total_length:.3f} km`")
+
+            c1, c2, c3 = st.columns([2, 2, 1])
+            c1.metric("Current Start Point", f"{kml_coords[0][0]:.6f}, {kml_coords[0][1]:.6f}")
+            c2.metric("Current End Point", f"{kml_coords[-1][0]:.6f}, {kml_coords[-1][1]:.6f}")
+            
+            if c3.button("🔄 Swap Start/End Points", use_container_width=True):
+                st.session_state.kml_data["swapped"] = not st.session_state.kml_data["swapped"]
+                st.rerun()
+
+            chain_offset = st.number_input(
+                "Chainage at Start Point (km)",
+                min_value=0.0, step=0.001, format="%.3f", value=0.0,
+                key='chain_offset'
+            )
+
+# --- SRT File Management UI ---
+if uploaded_srts:
+    # Check if the uploaded file list has changed
+    current_filenames = sorted([f.name for f in uploaded_srts])
+    previous_filenames = sorted([f.name for f in st.session_state.get('srt_files_cache', [])])
+
+    if current_filenames != previous_filenames:
+        with st.spinner("Analyzing SRT start times..."):
+            st.session_state.srt_files = sorted(
+                uploaded_srts,
+                key=lambda f: get_srt_start_time(f) or datetime.max
+            )
+        st.session_state.srt_files_cache = uploaded_srts.copy()
+
+    if st.session_state.srt_files:
+        with st.container(border=True):
+            st.subheader("SRT File Processing Order")
+            st.caption("Files are sorted chronologically by default. You can reorder them for processing.")
+
+            for i, f in enumerate(st.session_state.srt_files):
+                cols = st.columns([1, 8, 1, 1])
+                cols[0].write(f"**{i+1}.**")
+                cols[1].write(f.name)
+                if cols[2].button("⬆️", key=f"up_{i}", help="Move Up", disabled=(i == 0)):
+                    st.session_state.srt_files.insert(i-1, st.session_state.srt_files.pop(i))
+                    st.rerun()
+                if cols[3].button("⬇️", key=f"down_{i}", help="Move Down", disabled=(i == len(st.session_state.srt_files)-1)):
+                    st.session_state.srt_files.insert(i+1, st.session_state.srt_files.pop(i))
+                    st.rerun()
+            
+            if st.button("Reset to Chronological Order"):
+                 with st.spinner("Re-sorting files..."):
+                    st.session_state.srt_files = sorted(
+                        uploaded_srts,
+                        key=lambda f: get_srt_start_time(f) or datetime.max
+                    )
+                 st.rerun()
+
+
+st.markdown("---")
+
+# --- Processing Trigger ---
+if st.session_state.kml_data.get("coords") and st.session_state.srt_files:
+    if st.button("▶ Process and Generate Outputs", type="primary", use_container_width=True):
+        
+        # ---------------
+        # CORE PROCESSING
+        # ---------------
+        with st.spinner("Processing... This may take a moment."):
+            
+            # 1. Pre-compute KML chainage
+            kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
+            kml_chainage = calculate_cumulative_dist(kml_coords, st.session_state.chain_offset)
+            
+            # 2. Merge all SRT data
+            merged_srt_data = merge_srt_data(st.session_state.srt_files)
+
+            # 3. Project each SRT point onto the KML alignment
+            processed_data = []
+            for block in merged_srt_data:
+                point = (block['lat'], block['lon'])
+                chainage, proj_coords, offset = project_point_to_polyline(point, kml_coords, kml_chainage)
+                
+                block['chainage'] = chainage
+                block['proj_coords'] = proj_coords
+                block['offset'] = offset
+                processed_data.append(block)
+            
+            st.session_state.processed_data = processed_data
+            st.session_state.kml_chainage_map = kml_chainage
+            st.session_state.final_kml_coords = kml_coords
+            st.success("✅ Processing complete!")
+
+# ----------------------------
+# Section 2: Outputs & Visualization
+# ----------------------------
+if 'processed_data' in st.session_state:
+    st.header("Section 2: Outputs & Visualization")
+    
+    processed_data = st.session_state.processed_data
+    kml_coords = st.session_state.final_kml_coords
+    
+    # --- Summary Statistics ---
+    with st.container(border=True):
+        st.subheader("📊 Summary Statistics")
+        start_ch = processed_data[0]['chainage']
+        end_ch = processed_data[-1]['chainage']
+        
+        drone_path_coords = [(b['lat'], b['lon']) for b in processed_data]
+        total_flight_dist_km = calculate_cumulative_dist(drone_path_coords)[-1]
+        
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
+        sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
+        sc3.metric("Total Drone Flight Distance", f"{total_flight_dist_km * 1000:.1f} m")
+
+    # --- 3D Visualization ---
+    with st.container(border=True):
+        st.subheader("🗺️ 3D Visualization")
+        fig = go.Figure()
+        
+        # Plot KML Alignment
+        fig.add_trace(go.Scatter3d(
+            x=[c[1] for c in kml_coords], y=[c[0] for c in kml_coords], z=[0]*len(kml_coords),
+            mode='lines', line=dict(color='blue', width=10), name='KML Alignment'
+        ))
+        
+        # Plot Drone Paths
+        for i, srt_file in enumerate(st.session_state.srt_files):
+            flight_blocks = [b for b in processed_data if b['origin_index'] == i]
+            if not flight_blocks: continue
+            fig.add_trace(go.Scatter3d(
+                x=[p['lon'] for p in flight_blocks], y=[p['lat'] for p in flight_blocks], z=[p['alt'] for p in flight_blocks],
+                mode='lines', line=dict(color=PLOTLY_COLORS[i % len(PLOTLY_COLORS)], width=4), name=f'Flight: {srt_file.name}'
+            ))
+
+        # Plot Start/End Markers
+        start_block, end_block = processed_data[0], processed_data[-1]
+        fig.add_trace(go.Scatter3d(
+            x=[start_block['lon']], y=[start_block['lat']], z=[start_block['alt']],
+            mode='markers+text', text=[f"Start {start_block['chainage']:.3f} km"], textposition="top center",
+            marker=dict(size=5, color='green'), name='Start Point'
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=[end_block['lon']], y=[end_block['lat']], z=[end_block['alt']],
+            mode='markers+text', text=[f"End {end_block['chainage']:.3f} km"], textposition="bottom center",
+            marker=dict(size=5, color='darkred'), name='End Point'
+        ))
+        
+        fig.update_layout(
+            scene=dict(
+                xaxis_title='Longitude', yaxis_title='Latitude', zaxis_title='Altitude (m)',
+                aspectmode='data'
+            ),
+            margin=dict(r=20, b=10, l=10, t=10),
+            height=600,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Data Export Buttons ---
+    with st.container(border=True):
+        st.subheader("📁 Data Export")
+        dl_col1, dl_col2, dl_col3 = st.columns(3)
+
+        with dl_col1:
+            markers_kml_data = generate_markers_kml(kml_coords, st.session_state.kml_chainage_map)
+            st.download_button(
+                label="Download 50m Markers KML",
+                data=markers_kml_data,
+                file_name="markers_50m.kml",
+                mime="application/vnd.google-earth.kml+xml",
+                use_container_width=True
+            )
+        
+        with dl_col2:
+            route_kml_data = generate_multi_flight_kml(processed_data, st.session_state.srt_files)
+            st.download_button(
+                label="Download Drone Route KML",
+                data=route_kml_data,
+                file_name="drone_route.kml",
+                mime="application/vnd.google-earth.kml+xml",
+                use_container_width=True
+            )
+        
+        with dl_col3:
+            zip_buffer = generate_output_zip(processed_data, st.session_state.kml_data["name"])
+            st.download_button(
+                label="Download Processed SRTs (.zip)",
+                data=zip_buffer,
+                file_name="processed_srt_files.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+            
+    st.balloons()
