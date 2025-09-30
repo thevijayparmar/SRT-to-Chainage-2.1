@@ -6,3 +6,5 @@ numpy
 pandas
 lxml
 pytest
+Pillow
+moviepy
