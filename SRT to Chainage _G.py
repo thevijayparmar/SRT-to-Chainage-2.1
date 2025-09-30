@@ -5,7 +5,8 @@ import re
 import math
 import zipfile
 import io
-import xml.et.ElementTree as ET
+# --- MODIFIED: Switched to a more robust XML parser ---
+from lxml import etree as ET
 from datetime import datetime
 import plotly.graph_objects as go
 import os
@@ -151,6 +152,7 @@ def project_point_to_polyline(point, polyline_coords, polyline_chainage):
 # File Parsing and Data Handling Functions
 # ──────────────────────────────────────────────────────────────────────────
 
+# --- MODIFIED to use lxml for robustness ---
 @st.cache_data
 def parse_kml_2d(uploaded_file):
     """Parses a KML file to extract the first LineString coordinates."""
@@ -158,20 +160,23 @@ def parse_kml_2d(uploaded_file):
     file_content = uploaded_file.getvalue()
     # Reset buffer position for potential reuse
     uploaded_file.seek(0)
+    # Using lxml's parser which is more robust
     tree = ET.parse(io.BytesIO(file_content))
     
-    coord_element = tree.find('.//kml:LineString/kml:coordinates', ns)
+    # lxml uses the 'namespaces' keyword argument for find
+    coord_element = tree.find('.//kml:LineString/kml:coordinates', namespaces=ns)
     if coord_element is None:
         st.error("Could not find a LineString in the KML file.")
         return []
         
     coords = []
-    for part in coord_element.text.strip().split():
-        try:
-            lon, lat, *_ = part.split(',')
-            coords.append((float(lat), float(lon)))
-        except ValueError:
-            continue # Skip malformed coordinate pairs
+    if coord_element.text:
+        for part in coord_element.text.strip().split():
+            try:
+                lon, lat, *_ = part.split(',')
+                coords.append((float(lat), float(lon)))
+            except ValueError:
+                continue # Skip malformed coordinate pairs
     return coords
 
 # --- CORRECTED to handle both comma and dot for milliseconds ---
