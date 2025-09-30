@@ -5,6 +5,7 @@ import re
 import math
 import zipfile
 import io
+# --- MODIFIED: Switched to a more robust XML parser to resolve the error ---
 from lxml import etree as ET
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -423,10 +424,72 @@ with col2:
     uploaded_srts = st.file_uploader("Upload one or more drone .SRT files", type="srt", accept_multiple_files=True)
 
 if uploaded_kml:
-    # KML processing logic remains the same
-    # ... (code omitted for brevity but is identical to your working version)
+    if "kml_data" not in st.session_state or st.session_state.kml_data["name"] != uploaded_kml.name:
+        coords = parse_kml_2d(uploaded_kml)
+        if coords:
+            st.session_state.kml_data = {"name": uploaded_kml.name, "coords": coords, "swapped": False}
+        else:
+            st.session_state.kml_data = {"name": None, "coords": None, "swapped": False}
 
-# --- NEW: Moved processing options to their own phase ---
+    if st.session_state.kml_data["coords"]:
+        with st.container(border=True):
+            st.subheader("KML Alignment Configuration")
+            kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
+            total_length = calculate_cumulative_dist(kml_coords)[-1]
+
+            st.metric(label="Total Alignment Length", value=f"{total_length:.3f} km")
+            st.markdown("---") 
+
+            c1, c2, c3 = st.columns([2, 2, 1])
+            c1.metric("Current Start Point", f"{kml_coords[0][0]:.6f}, {kml_coords[0][1]:.6f}")
+            c2.metric("Current End Point", f"{kml_coords[-1][0]:.6f}, {kml_coords[-1][1]:.6f}")
+            
+            if c3.button("🔄 Swap Start/End Points", use_container_width=True):
+                st.session_state.kml_data["swapped"] = not st.session_state.kml_data["swapped"]
+                st.rerun()
+
+            st.session_state.chain_offset = st.number_input(
+                "Chainage at Start Point (km)",
+                min_value=0.0, step=0.001, format="%.3f", value=0.0
+            )
+
+if uploaded_srts:
+    current_filenames = sorted([f.name for f in uploaded_srts])
+    if "srt_files_cache" not in st.session_state or current_filenames != sorted([f.name for f in st.session_state.srt_files_cache]):
+        with st.spinner("Analyzing SRT files..."):
+            file_infos = []
+            for f in uploaded_srts:
+                start_time, duration = get_srt_file_info(f)
+                file_infos.append({"file": f, "start_time": start_time, "duration": duration})
+            
+            st.session_state.srt_files = sorted(file_infos, key=lambda x: x["start_time"] or datetime.max)
+        st.session_state.srt_files_cache = uploaded_srts.copy()
+
+    if st.session_state.srt_files:
+        with st.container(border=True):
+            st.subheader("SRT File Processing Order")
+            st.caption("Files are sorted chronologically by default. You can reorder them for processing.")
+
+            for i, info in enumerate(st.session_state.srt_files):
+                f = info["file"]
+                duration_str = format_timedelta(info["duration"]) if info["duration"] else "N/A"
+                
+                cols = st.columns([1, 8, 3, 1, 1])
+                cols[0].write(f"**{i+1}.**")
+                cols[1].write(f.name)
+                cols[2].write(f"_(Duration: {duration_str})_")
+                if cols[3].button("⬆️", key=f"up_{i}", help="Move Up", disabled=(i == 0)):
+                    st.session_state.srt_files.insert(i-1, st.session_state.srt_files.pop(i))
+                    st.rerun()
+                if cols[4].button("⬇️", key=f"down_{i}", help="Move Down", disabled=(i == len(st.session_state.srt_files)-1)):
+                    st.session_state.srt_files.insert(i+1, st.session_state.srt_files.pop(i))
+                    st.rerun()
+            
+            if st.button("Reset to Chronological Order"):
+                 with st.spinner("Re-sorting files..."):
+                    st.session_state.srt_files = sorted(st.session_state.srt_files, key=lambda x: x["start_time"] or datetime.max)
+                 st.rerun()
+
 st.markdown("---")
 st.header("Phase 2: Processing & Standard Export")
 
@@ -435,27 +498,17 @@ if not (uploaded_kml and uploaded_srts):
 else:
     with st.container(border=True):
         st.subheader("Processing Options")
-        
-        # --- NEW: Thinning Option ---
         use_thinning = st.toggle("Enable SRT Thinning (Recommended)", value=True)
         thin_rate = 0
         if use_thinning:
             thin_rate = st.number_input(
-                "Data Blocks per Second", 
-                min_value=1, 
-                max_value=30, 
-                value=5, 
-                step=1, 
-                help="Reduces the number of SRT entries for better performance in video editors. 5 is a good balance of accuracy and performance."
+                "Data Blocks per Second", min_value=1, max_value=30, value=5, step=1, 
+                help="Reduces the number of SRT entries for better performance in video editors. 5 is a good balance."
             )
 
         if st.button("▶ Process and Generate Outputs", type="primary", use_container_width=True):
-            # --- NEW: Progress Bar ---
             st.subheader("⚙️ Processing...")
             progress_bar = st.progress(0, text="Initializing...")
-            
-            # (Core processing logic remains the same)
-            # ... (code omitted for brevity but is identical to your working version)
             
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             kml_chainage = calculate_cumulative_dist(kml_coords, st.session_state.chain_offset)
@@ -469,7 +522,6 @@ else:
                 chainage, proj_coords, offset = project_point_to_polyline(point, kml_coords, kml_chainage)
                 block.update({'chainage': chainage, 'proj_coords': proj_coords, 'offset': offset})
                 processed_data.append(block)
-                # Update progress bar
                 progress_bar.progress((i + 1) / total_points, text=f"Projecting point {i+1} of {total_points}...")
 
             st.session_state.processed_data = processed_data
@@ -480,59 +532,75 @@ else:
             progress_bar.empty()
             st.success("✅ Processing complete!")
 
-
-# ----------------------------
-# Section 3: Outputs & Visualization
-# ----------------------------
 if 'processed_data' in st.session_state:
     st.header("Phase 3: Visualization & Export")
+    processed_data = st.session_state.processed_data
+    kml_coords = st.session_state.final_kml_coords
     
-    # (All visualization and standard export logic remains the same)
-    # ... (code omitted for brevity but is identical to your working version)
+    with st.container(border=True):
+        st.subheader("📊 Summary Statistics")
+        start_ch = processed_data[0]['chainage']
+        end_ch = processed_data[-1]['chainage']
+        total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
+        
+        sc1, sc2, sc3 = st.columns(3)
+        sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
+        sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
+        sc3.metric("Total Merged Flight Duration", format_timedelta(total_duration))
 
-# --- NEW: Phase 4 for Video Export ---
+    with st.container(border=True):
+        st.subheader("🗺️ 3D Visualization")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter3d(x=[c[1] for c in kml_coords], y=[c[0] for c in kml_coords], z=[0]*len(kml_coords), mode='lines', line=dict(color='blue', width=10), name='KML Alignment'))
+        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+        for i, srt_file in enumerate(srt_file_objects):
+            flight_blocks = [b for b in processed_data if b['origin_index'] == i]
+            if not flight_blocks: continue
+            fig.add_trace(go.Scatter3d(x=[p['lon'] for p in flight_blocks], y=[p['lat'] for p in flight_blocks], z=[p['alt'] for p in flight_blocks], mode='lines', line=dict(color=PLOTLY_COLORS[i % len(PLOTLY_COLORS)], width=4), name=f'Flight: {srt_file.name}'))
+        start_block, end_block = processed_data[0], processed_data[-1]
+        fig.add_trace(go.Scatter3d(x=[start_block['lon']], y=[start_block['lat']], z=[start_block['alt']], mode='markers+text', text=[f"Start {start_block['chainage']:.3f} km"], textposition="top center", marker=dict(size=5, color='green'), name='Start Point'))
+        fig.add_trace(go.Scatter3d(x=[end_block['lon']], y=[end_block['lat']], z=[end_block['alt']], mode='markers+text', text=[f"End {end_block['chainage']:.3f} km"], textposition="bottom center", marker=dict(size=5, color='darkred'), name='End Point'))
+        fig.update_layout(scene=dict(xaxis_title='Longitude', yaxis_title='Latitude', zaxis_title='Altitude (m)', aspectmode='data'), margin=dict(r=20, b=10, l=10, t=10), height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("🌍 2D Map Visualization")
+        df = pd.DataFrame(processed_data)
+        map_fig = go.Figure()
+        map_fig.add_trace(go.Scattermapbox(mode="lines", lon=[c[1] for c in kml_coords], lat=[c[0] for c in kml_coords], marker={'color': 'blue', 'size': 10}, name="KML Alignment"))
+        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+        for i, srt_file in enumerate(srt_file_objects):
+            flight_df = df[df['origin_index'] == i]
+            if flight_df.empty: continue
+            map_fig.add_trace(go.Scattermapbox(mode="lines", lon=flight_df['lon'], lat=flight_df['lat'], marker={'color': PLOTLY_COLORS[i % len(PLOTLY_COLORS)]}, name=f'Flight: {srt_file.name}'))
+        map_fig.update_layout(mapbox_style="open-street-map", mapbox_zoom=10, mapbox_center_lat=df['lat'].mean(), mapbox_center_lon=df['lon'].mean(), margin={"r":0,"t":0,"l":0,"b":0}, height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        st.plotly_chart(map_fig, use_container_width=True)
+
+    with st.container(border=True):
+        st.subheader("📁 Standard Export (SRT & KML)")
+        st.write("Click the button below to download a single ZIP file containing the structured KML and all processed/thinned SRT files.")
+        zip_buffer = generate_master_zip(processed_data, kml_coords, st.session_state.kml_chainage_map, [info['file'] for info in st.session_state.srt_files], st.session_state.kml_data["name"], st.session_state.get('thin_rate'))
+        st.download_button(label="⬇️ Download Standard Outputs (.zip)", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
+
 if 'processed_data' in st.session_state:
     st.markdown("---")
     st.header("Phase 4: Video Clip Export (Optional)")
-
     with st.expander("Click here to configure and generate video overlays"):
         if not MOVIEPY_AVAILABLE:
-            st.error(
-                "**Video Generation Disabled:** The `moviepy` library is not installed in this environment. "
-                "Please run `pip install moviepy` in your terminal to enable this feature."
-            )
+            st.error("**Video Generation Disabled:** The `moviepy` library is not installed in this environment. Please run `pip install moviepy` in your terminal to enable this feature.")
         else:
-            st.write(
-                "This will generate a separate video clip for each data type (Latitude, Chainage, etc.) "
-                "with the data burned in. These clips can be easily layered over your main video in an editor."
-            )
+            st.write("This will generate a separate video clip for each data type (Latitude, Chainage, etc.) with the data burned in. These clips can be easily layered over your main video in an editor.")
             v_col1, v_col2 = st.columns(2)
             with v_col1:
                 vid_width = st.number_input("Max Video Width (px)", min_value=100, max_value=1920, value=300, step=10)
                 font_color = st.color_picker("Font Color", value="#FFFFFF")
             with v_col2:
-                vid_fps = 5 # As per your requirement
+                vid_fps = 5 
                 st.text_input("Frame Rate (FPS)", value=f"{vid_fps} (Fixed)", disabled=True)
-                bg_color = st.color_picker("Background Color", value="#008000") # Green
-
+                bg_color = st.color_picker("Background Color", value="#008000")
             if st.button("🎬 Generate and Download Video Clips", use_container_width=True):
                 with st.spinner("Generating video clips... This may take a while."):
-                    video_zip_buffer = generate_video_clips_zip(
-                        st.session_state.processed_data,
-                        st.session_state.kml_data["name"],
-                        width=vid_width,
-                        font_color=font_color,
-                        bg_color=bg_color,
-                        fps=vid_fps,
-                        thin_rate=st.session_state.get('thin_rate')
-                    )
-                
+                    video_zip_buffer = generate_video_clips_zip(st.session_state.processed_data, st.session_state.kml_data["name"], width=vid_width, font_color=font_color, bg_color=bg_color, fps=vid_fps, thin_rate=st.session_state.get('thin_rate'))
                 if video_zip_buffer:
-                    st.download_button(
-                        label="⬇️ Download All Video Clips (.zip)",
-                        data=video_zip_buffer,
-                        file_name="SRT_Video_Clips.zip",
-                        mime="application/zip",
-                        use_container_width=True,
-                        type="primary"
-                    )
+                    st.download_button(label="⬇️ Download All Video Clips (.zip)", data=video_zip_buffer, file_name="SRT_Video_Clips.zip", mime="application/zip", use_container_width=True, type="primary")
+
