@@ -149,6 +149,7 @@ def get_srt_file_info(uploaded_file):
     except Exception:
         return None, None
 
+# --- CORRECTED to handle 'rel_alt' and be more robust ---
 def parse_srt(file_content_str, origin_index, start_idx=1):
     """Parses a single SRT file's content, creating full datetime objects."""
     blocks = []
@@ -157,10 +158,13 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
     for block_text in srt_blocks:
         if not block_text.strip(): continue
         lat, lon, alt, datetime_obj = None, None, 0.0, None
+        
         lat_match = re.search(r"\[latitude:\s*([0-9.\-]+)", block_text)
         lon_match = re.search(r"\[longitude:\s*([0-9.\-]+)", block_text)
-        alt_match = re.search(r"\[altitude:\s*([0-9.\-]+)", block_text)
+        # THE FIX: This regex now finds 'rel_alt' OR 'altitude'
+        alt_match = re.search(r"\[(?:rel_alt|altitude):\s*([0-9.\-]+)", block_text)
         time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", block_text)
+
         if lat_match: lat = float(lat_match.group(1))
         if lon_match: lon = float(lon_match.group(1))
         if alt_match: alt = float(alt_match.group(1))
@@ -533,56 +537,64 @@ else:
             st.success("✅ Processing complete!")
 
 if 'processed_data' in st.session_state:
-    st.header("Phase 3: Visualization & Export")
-    processed_data = st.session_state.processed_data
-    kml_coords = st.session_state.final_kml_coords
-    
-    with st.container(border=True):
-        st.subheader("📊 Summary Statistics")
-        start_ch = processed_data[0]['chainage']
-        end_ch = processed_data[-1]['chainage']
-        total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
+    # --- ADDED: Safety check for empty processed_data ---
+    if not st.session_state.processed_data:
+        st.error(
+            "**Processing Error:** No valid data points could be found in the uploaded SRT files. "
+            "Please check that the files contain `[latitude: ...]`, `[longitude: ...]`, `[rel_alt: ...]`, "
+            "and a full timestamp (e.g., `YYYY-MM-DD HH:MM:SS.ms`)."
+        )
+    else:
+        st.header("Phase 3: Visualization & Export")
+        processed_data = st.session_state.processed_data
+        kml_coords = st.session_state.final_kml_coords
         
-        sc1, sc2, sc3 = st.columns(3)
-        sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
-        sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
-        sc3.metric("Total Merged Flight Duration", format_timedelta(total_duration))
+        with st.container(border=True):
+            st.subheader("📊 Summary Statistics")
+            start_ch = processed_data[0]['chainage']
+            end_ch = processed_data[-1]['chainage']
+            total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
+            
+            sc1, sc2, sc3 = st.columns(3)
+            sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
+            sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
+            sc3.metric("Total Merged Flight Duration", format_timedelta(total_duration))
 
-    with st.container(border=True):
-        st.subheader("🗺️ 3D Visualization")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter3d(x=[c[1] for c in kml_coords], y=[c[0] for c in kml_coords], z=[0]*len(kml_coords), mode='lines', line=dict(color='blue', width=10), name='KML Alignment'))
-        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
-        for i, srt_file in enumerate(srt_file_objects):
-            flight_blocks = [b for b in processed_data if b['origin_index'] == i]
-            if not flight_blocks: continue
-            fig.add_trace(go.Scatter3d(x=[p['lon'] for p in flight_blocks], y=[p['lat'] for p in flight_blocks], z=[p['alt'] for p in flight_blocks], mode='lines', line=dict(color=PLOTLY_COLORS[i % len(PLOTLY_COLORS)], width=4), name=f'Flight: {srt_file.name}'))
-        start_block, end_block = processed_data[0], processed_data[-1]
-        fig.add_trace(go.Scatter3d(x=[start_block['lon']], y=[start_block['lat']], z=[start_block['alt']], mode='markers+text', text=[f"Start {start_block['chainage']:.3f} km"], textposition="top center", marker=dict(size=5, color='green'), name='Start Point'))
-        fig.add_trace(go.Scatter3d(x=[end_block['lon']], y=[end_block['lat']], z=[end_block['alt']], mode='markers+text', text=[f"End {end_block['chainage']:.3f} km"], textposition="bottom center", marker=dict(size=5, color='darkred'), name='End Point'))
-        fig.update_layout(scene=dict(xaxis_title='Longitude', yaxis_title='Latitude', zaxis_title='Altitude (m)', aspectmode='data'), margin=dict(r=20, b=10, l=10, t=10), height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig, use_container_width=True)
+        with st.container(border=True):
+            st.subheader("🗺️ 3D Visualization")
+            fig = go.Figure()
+            fig.add_trace(go.Scatter3d(x=[c[1] for c in kml_coords], y=[c[0] for c in kml_coords], z=[0]*len(kml_coords), mode='lines', line=dict(color='blue', width=10), name='KML Alignment'))
+            srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+            for i, srt_file in enumerate(srt_file_objects):
+                flight_blocks = [b for b in processed_data if b['origin_index'] == i]
+                if not flight_blocks: continue
+                fig.add_trace(go.Scatter3d(x=[p['lon'] for p in flight_blocks], y=[p['lat'] for p in flight_blocks], z=[p['alt'] for p in flight_blocks], mode='lines', line=dict(color=PLOTLY_COLORS[i % len(PLOTLY_COLORS)], width=4), name=f'Flight: {srt_file.name}'))
+            start_block, end_block = processed_data[0], processed_data[-1]
+            fig.add_trace(go.Scatter3d(x=[start_block['lon']], y=[start_block['lat']], z=[start_block['alt']], mode='markers+text', text=[f"Start {start_block['chainage']:.3f} km"], textposition="top center", marker=dict(size=5, color='green'), name='Start Point'))
+            fig.add_trace(go.Scatter3d(x=[end_block['lon']], y=[end_block['lat']], z=[end_block['alt']], mode='markers+text', text=[f"End {end_block['chainage']:.3f} km"], textposition="bottom center", marker=dict(size=5, color='darkred'), name='End Point'))
+            fig.update_layout(scene=dict(xaxis_title='Longitude', yaxis_title='Latitude', zaxis_title='Altitude (m)', aspectmode='data'), margin=dict(r=20, b=10, l=10, t=10), height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            st.plotly_chart(fig, use_container_width=True)
 
-    with st.container(border=True):
-        st.subheader("🌍 2D Map Visualization")
-        df = pd.DataFrame(processed_data)
-        map_fig = go.Figure()
-        map_fig.add_trace(go.Scattermapbox(mode="lines", lon=[c[1] for c in kml_coords], lat=[c[0] for c in kml_coords], marker={'color': 'blue', 'size': 10}, name="KML Alignment"))
-        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
-        for i, srt_file in enumerate(srt_file_objects):
-            flight_df = df[df['origin_index'] == i]
-            if flight_df.empty: continue
-            map_fig.add_trace(go.Scattermapbox(mode="lines", lon=flight_df['lon'], lat=flight_df['lat'], marker={'color': PLOTLY_COLORS[i % len(PLOTLY_COLORS)]}, name=f'Flight: {srt_file.name}'))
-        map_fig.update_layout(mapbox_style="open-street-map", mapbox_zoom=10, mapbox_center_lat=df['lat'].mean(), mapbox_center_lon=df['lon'].mean(), margin={"r":0,"t":0,"l":0,"b":0}, height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(map_fig, use_container_width=True)
+        with st.container(border=True):
+            st.subheader("🌍 2D Map Visualization")
+            df = pd.DataFrame(processed_data)
+            map_fig = go.Figure()
+            map_fig.add_trace(go.Scattermapbox(mode="lines", lon=[c[1] for c in kml_coords], lat=[c[0] for c in kml_coords], marker={'color': 'blue', 'size': 10}, name="KML Alignment"))
+            srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+            for i, srt_file in enumerate(srt_file_objects):
+                flight_df = df[df['origin_index'] == i]
+                if flight_df.empty: continue
+                map_fig.add_trace(go.Scattermapbox(mode="lines", lon=flight_df['lon'], lat=flight_df['lat'], marker={'color': PLOTLY_COLORS[i % len(PLOTLY_COLORS)]}, name=f'Flight: {srt_file.name}'))
+            map_fig.update_layout(mapbox_style="open-street-map", mapbox_zoom=10, mapbox_center_lat=df['lat'].mean(), mapbox_center_lon=df['lon'].mean(), margin={"r":0,"t":0,"l":0,"b":0}, height=600, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+            st.plotly_chart(map_fig, use_container_width=True)
 
-    with st.container(border=True):
-        st.subheader("📁 Standard Export (SRT & KML)")
-        st.write("Click the button below to download a single ZIP file containing the structured KML and all processed/thinned SRT files.")
-        zip_buffer = generate_master_zip(processed_data, kml_coords, st.session_state.kml_chainage_map, [info['file'] for info in st.session_state.srt_files], st.session_state.kml_data["name"], st.session_state.get('thin_rate'))
-        st.download_button(label="⬇️ Download Standard Outputs (.zip)", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
+        with st.container(border=True):
+            st.subheader("📁 Standard Export (SRT & KML)")
+            st.write("Click the button below to download a single ZIP file containing the structured KML and all processed/thinned SRT files.")
+            zip_buffer = generate_master_zip(processed_data, kml_coords, st.session_state.kml_chainage_map, [info['file'] for info in st.session_state.srt_files], st.session_state.kml_data["name"], st.session_state.get('thin_rate'))
+            st.download_button(label="⬇️ Download Standard Outputs (.zip)", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
 
-if 'processed_data' in st.session_state:
+if 'processed_data' in st.session_state and st.session_state.processed_data:
     st.markdown("---")
     st.header("Phase 4: Video Clip Export (Optional)")
     with st.expander("Click here to configure and generate video overlays"):
