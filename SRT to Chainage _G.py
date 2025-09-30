@@ -13,6 +13,8 @@ import os
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
+import time
+import random
 
 # --- ADDED for video creation ---
 # Note: moviepy is a heavy library. If not available, the video section will be disabled.
@@ -134,7 +136,6 @@ def parse_kml_2d(uploaded_file):
                 continue
     return coords
 
-# --- NEW: Calculates start time AND duration ---
 @st.cache_data
 def get_srt_file_info(uploaded_file):
     """Efficiently reads an SRT file to get its start time and duration."""
@@ -319,7 +320,7 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
     zip_buffer.seek(0)
     return zip_buffer
 
-# --- NEW: Video Generation Function ---
+# --- MODIFIED: Video Generation Function with Error Logging ---
 def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_color, fps, thin_rate):
     """Creates a ZIP file containing video clips for each SRT data type."""
     if not MOVIEPY_AVAILABLE:
@@ -340,6 +341,10 @@ def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_col
         data_to_process = thinned_data
     else:
         data_to_process = processed_data
+        
+    if not data_to_process:
+        st.error("No data available to generate videos after thinning.")
+        return None
 
     # Prepare data columns for video files
     prefix = os.path.splitext(kml_name)[0]
@@ -367,34 +372,38 @@ def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_col
     with zipfile.ZipFile(video_zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         for i, (filename, data_col) in enumerate(video_cols.items()):
             status_text.info(f"Generating video for: `{filename}` ({i+1}/{num_videos})...")
-            frames = []
-            for text in data_col:
-                # Dynamically determine image size
-                try:
-                    # Modern Pillow
-                    left, top, right, bottom = font.getbbox(text)
-                    text_width, text_height = right - left, bottom - top
-                except AttributeError:
-                    # Older Pillow
-                    text_width, text_height = font.getsize(text)
+            try:
+                frames = []
+                for text in data_col:
+                    try:
+                        left, top, right, bottom = font.getbbox(text)
+                        text_width, text_height = right - left, bottom - top
+                    except AttributeError:
+                        text_width, text_height = font.getsize(text)
 
-                img_height = text_height + 20 # Add some padding
-                img = Image.new('RGB', (width, img_height), color=bg_color)
-                draw = ImageDraw.Draw(img)
-                # Center the text
-                draw.text(((width - text_width) / 2, 10), text, font=font, fill=font_color)
-                frames.append(np.array(img))
-            
-            # Create video clip
-            clip = ImageSequenceClip(frames, fps=fps)
-            
-            # Write to an in-memory file
-            with io.BytesIO() as temp_buffer:
-                clip.write_videofile(temp_buffer, codec="libx264", fps=fps, logger=None, preset='ultrafast')
-                temp_buffer.seek(0)
-                zf.writestr(filename, temp_buffer.read())
-            
-            progress_bar.progress((i + 1) / num_videos)
+                    img_height = text_height + 20
+                    img = Image.new('RGB', (width, img_height), color=bg_color)
+                    draw = ImageDraw.Draw(img)
+                    draw.text(((width - text_width) / 2, 10), text, font=font, fill=font_color)
+                    frames.append(np.array(img))
+                
+                clip = ImageSequenceClip(frames, fps=fps)
+                
+                with io.BytesIO() as temp_buffer:
+                    clip.write_videofile(temp_buffer, codec="libx264", fps=fps, logger=None, preset='ultrafast')
+                    temp_buffer.seek(0)
+                    zf.writestr(filename, temp_buffer.read())
+                
+                progress_bar.progress((i + 1) / num_videos)
+
+            except Exception as e:
+                # --- NEW: Error logging for video generation ---
+                st.error(f"Failed to generate video: `{filename}`.")
+                with st.expander("Click to see error details"):
+                    st.exception(e)
+                    st.info("This error often occurs if `ffmpeg` is not installed on your system. "
+                            "MoviePy requires `ffmpeg` for video processing. Please ensure it is installed and accessible in your system's PATH.")
+                return None # Stop the process if one video fails
 
     status_text.success("All video clips generated successfully!")
     progress_bar.empty()
@@ -439,14 +448,14 @@ if uploaded_kml:
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             total_length = calculate_cumulative_dist(kml_coords)[-1]
 
-            st.metric(label="Total Alignment Length", value=f"{total_length:.3f} km")
+            st.metric(label="**Total Alignment Length**", value=f"**{total_length:.3f} km**")
             st.markdown("---") 
 
             c1, c2, c3 = st.columns([2, 2, 1])
             c1.metric("Current Start Point", f"{kml_coords[0][0]:.6f}, {kml_coords[0][1]:.6f}")
             c2.metric("Current End Point", f"{kml_coords[-1][0]:.6f}, {kml_coords[-1][1]:.6f}")
             
-            if c3.button("🔄 Swap Start/End Points", use_container_width=True):
+            if c3.button("🔄 **Swap Start/End Points**", use_container_width=True):
                 st.session_state.kml_data["swapped"] = not st.session_state.kml_data["swapped"]
                 st.rerun()
 
@@ -479,7 +488,7 @@ if uploaded_srts:
                 cols = st.columns([1, 8, 3, 1, 1])
                 cols[0].write(f"**{i+1}.**")
                 cols[1].write(f.name)
-                cols[2].write(f"_(Duration: {duration_str})_")
+                cols[2].write(f"_(Duration: **{duration_str}**)_")
                 if cols[3].button("⬆️", key=f"up_{i}", help="Move Up", disabled=(i == 0)):
                     st.session_state.srt_files.insert(i-1, st.session_state.srt_files.pop(i))
                     st.rerun()
@@ -487,7 +496,7 @@ if uploaded_srts:
                     st.session_state.srt_files.insert(i+1, st.session_state.srt_files.pop(i))
                     st.rerun()
             
-            if st.button("Reset to Chronological Order"):
+            if st.button("**Reset to Chronological Order**"):
                  with st.spinner("Re-sorting files..."):
                     st.session_state.srt_files = sorted(st.session_state.srt_files, key=lambda x: x["start_time"] or datetime.max)
                  st.rerun()
@@ -508,9 +517,8 @@ else:
                 help="Reduces the number of SRT entries for better performance in video editors. 5 is a good balance."
             )
 
-        if st.button("▶ Process and Generate Outputs", type="primary", use_container_width=True):
+        if st.button("▶ **Process and Generate Outputs**", type="primary", use_container_width=True):
             st.subheader("⚙️ Processing...")
-            progress_bar = st.progress(0, text="Initializing...")
             
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             kml_chainage = calculate_cumulative_dist(kml_coords, st.session_state.chain_offset)
@@ -519,23 +527,83 @@ else:
             
             processed_data = []
             total_points = len(merged_srt_data)
-            for i, block in enumerate(merged_srt_data):
-                point = (block['lat'], block['lon'])
-                chainage, proj_coords, offset = project_point_to_polyline(point, kml_coords, kml_chainage)
-                block.update({'chainage': chainage, 'proj_coords': proj_coords, 'offset': offset})
-                processed_data.append(block)
-                progress_bar.progress((i + 1) / total_points, text=f"Projecting point {i+1} of {total_points}...")
+
+            # --- NEW: Arcade Progress Bar ---
+            if total_points > 0:
+                progress_placeholder = st.empty()
+                
+                # Arcade animation setup
+                width = 50 # Width of the progress bar area
+                sky_height = 5
+                sky = [[' ' for _ in range(width)] for _ in range(sky_height)]
+                bullets = [] # (y, x)
+                
+                for i, block in enumerate(merged_srt_data):
+                    point = (block['lat'], block['lon'])
+                    chainage, proj_coords, offset = project_point_to_polyline(point, kml_coords, kml_chainage)
+                    block.update({'chainage': chainage, 'proj_coords': proj_coords, 'offset': offset})
+                    processed_data.append(block)
+                    
+                    # Update animation periodically
+                    if i % 25 == 0 or i == total_points - 1:
+                        progress = (i + 1) / total_points
+                        
+                        # Tank position
+                        tank_pos = int(progress * (width - 3))
+                        
+                        # Bullets
+                        bullets.append([sky_height - 1, tank_pos + 1])
+                        new_bullets = []
+                        for b in bullets:
+                            if b[0] > 0:
+                                b[0] -= 1
+                                new_bullets.append(b)
+                        bullets = new_bullets
+
+                        # Sky objects
+                        for y in range(sky_height - 1, 0, -1):
+                            sky[y] = sky[y-1]
+                        sky[0] = [' ' for _ in range(width)]
+                        if random.random() < 0.3: # Chance to spawn a new object
+                            sky[0][random.randint(0, width - 1)] = random.choice(['🎈', '💣', '🪨', '⭐'])
+                        
+                        # Collision
+                        for y, row in enumerate(sky):
+                            for x, cell in enumerate(row):
+                                if cell in ['🎈', '💣', '🪨', '⭐']:
+                                    for b_idx, b in enumerate(bullets):
+                                        if b[0] == y and b[1] == x:
+                                            sky[y][x] = random.choice(['✨', '💥', '💨', '🔥'])
+                                            bullets.pop(b_idx)
+                                            break
+                        
+                        # Draw sky with bullets
+                        display_sky = [row[:] for row in sky]
+                        for r, c in bullets:
+                            if 0 <= r < sky_height and 0 <= c < width:
+                                display_sky[r][c] = random.choice(['|', '🚀', '⚡'])
+                        
+                        sky_str = "\n".join("".join(row) for row in display_sky)
+
+                        bar = '█' * tank_pos + '🚚' + '─' * (width - tank_pos - 3)
+                        
+                        progress_placeholder.code(
+                            f"{sky_str}\n"
+                            f"[{bar}]\n"
+                            f"Processing: {i+1} / {total_points}",
+                            language=None
+                        )
+                        time.sleep(0.01)
 
             st.session_state.processed_data = processed_data
             st.session_state.kml_chainage_map = kml_chainage
             st.session_state.final_kml_coords = kml_coords
             st.session_state.thin_rate = thin_rate if use_thinning else None
             
-            progress_bar.empty()
+            progress_placeholder.empty()
             st.success("✅ Processing complete!")
 
 if 'processed_data' in st.session_state:
-    # --- ADDED: Safety check for empty processed_data ---
     if not st.session_state.processed_data:
         st.error(
             "**Processing Error:** No valid data points could be found in the uploaded SRT files. "
@@ -554,9 +622,9 @@ if 'processed_data' in st.session_state:
             total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
             
             sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
-            sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
-            sc3.metric("Total Merged Flight Duration", format_timedelta(total_duration))
+            sc1.metric("Merged SRT Start Chainage", f"**{start_ch:.3f} km**")
+            sc2.metric("Merged SRT End Chainage", f"**{end_ch:.3f} km**")
+            sc3.metric("Total Merged Flight Duration", f"**{format_timedelta(total_duration)}**")
 
         with st.container(border=True):
             st.subheader("🗺️ 3D Visualization")
