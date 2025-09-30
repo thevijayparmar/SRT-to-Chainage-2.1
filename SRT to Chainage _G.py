@@ -134,6 +134,7 @@ def parse_kml_2d(uploaded_file):
                 continue
     return coords
 
+# --- NEW: Calculates start time AND duration ---
 @st.cache_data
 def get_srt_file_info(uploaded_file):
     """Efficiently reads an SRT file to get its start time and duration."""
@@ -149,7 +150,6 @@ def get_srt_file_info(uploaded_file):
     except Exception:
         return None, None
 
-# --- CORRECTED to handle 'rel_alt' and be more robust ---
 def parse_srt(file_content_str, origin_index, start_idx=1):
     """Parses a single SRT file's content, creating full datetime objects."""
     blocks = []
@@ -158,10 +158,8 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
     for block_text in srt_blocks:
         if not block_text.strip(): continue
         lat, lon, alt, datetime_obj = None, None, 0.0, None
-        
         lat_match = re.search(r"\[latitude:\s*([0-9.\-]+)", block_text)
         lon_match = re.search(r"\[longitude:\s*([0-9.\-]+)", block_text)
-        # THE FIX: This regex now finds 'rel_alt' OR 'altitude'
         alt_match = re.search(r"\[(?:rel_alt|altitude):\s*([0-9.\-]+)", block_text)
         time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", block_text)
 
@@ -592,7 +590,7 @@ if 'processed_data' in st.session_state:
             st.subheader("📁 Standard Export (SRT & KML)")
             st.write("Click the button below to download a single ZIP file containing the structured KML and all processed/thinned SRT files.")
             zip_buffer = generate_master_zip(processed_data, kml_coords, st.session_state.kml_chainage_map, [info['file'] for info in st.session_state.srt_files], st.session_state.kml_data["name"], st.session_state.get('thin_rate'))
-            st.download_button(label="⬇️ Download Standard Outputs (.zip)", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
+            st.download_button(label="⬇️ **Download Standard Outputs (.zip)**", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
 
 if 'processed_data' in st.session_state and st.session_state.processed_data:
     st.markdown("---")
@@ -608,10 +606,11 @@ if 'processed_data' in st.session_state and st.session_state.processed_data:
                 font_color = st.color_picker("Font Color", value="#FFFFFF")
             with v_col2:
                 vid_fps = 5 
-                st.text_input("Frame Rate (FPS)", value=f"{vid_fps} (Fixed)", disabled=True)
+                st.text_input("Frame Rate (FPS)", value=f"**{vid_fps}** (Fixed)", disabled=True)
                 bg_color = st.color_picker("Background Color", value="#008000")
-            if st.button("🎬 Generate and Download Video Clips", use_container_width=True):
+            if st.button("🎬 **Generate and Download Video Clips**", use_container_width=True):
                 with st.spinner("Generating video clips... This may take a while."):
                     video_zip_buffer = generate_video_clips_zip(st.session_state.processed_data, st.session_state.kml_data["name"], width=vid_width, font_color=font_color, bg_color=bg_color, fps=vid_fps, thin_rate=st.session_state.get('thin_rate'))
                 if video_zip_buffer:
-                    st.download_button(label="⬇️ Download All Video Clips (.zip)", data=video_zip_buffer, file_name="SRT_Video_Clips.zip", mime="application/zip", use_container_width=True, type="primary")
+                    st.download_button(label="⬇️ **Download All Video Clips (.zip)**", data=video_zip_buffer, file_name="SRT_Video_Clips.zip", mime="application/zip", use_container_width=True, type="primary")
+
