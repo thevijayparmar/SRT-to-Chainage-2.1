@@ -615,4 +615,3 @@ if 'processed_data' in st.session_state and st.session_state.processed_data:
                     video_zip_buffer = generate_video_clips_zip(st.session_state.processed_data, st.session_state.kml_data["name"], width=vid_width, font_color=font_color, bg_color=bg_color, fps=vid_fps, thin_rate=st.session_state.get('thin_rate'))
                 if video_zip_buffer:
                     st.download_button(label="⬇️ Download All Video Clips (.zip)", data=video_zip_buffer, file_name="SRT_Video_Clips.zip", mime="application/zip", use_container_width=True, type="primary")
-
