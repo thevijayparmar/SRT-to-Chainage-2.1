@@ -35,8 +35,8 @@ st.set_page_config(page_title="Drone SRT & Chainage v2.0", layout="wide")
 
 PLOTLY_COLORS = [
     '#FF0000', '#FFA500', '#008000', '#0000FF', '#4B0082', '#EE82EE', 
-    '#A52A2A', '#00FFFF', '#FF00FF', '#808000'
-] # Red, Orange, Green, Blue, Indigo, Violet, Brown, Cyan, Magenta, Olive
+    '#A52A2A', '#00FFFF', '#FF00FF', '#808080'
+] # Red, Orange, Green, Blue, Indigo, Violet, Brown, Cyan, Magenta, Grey
 
 if 'kml_data' not in st.session_state:
     st.session_state.kml_data = {
@@ -238,7 +238,6 @@ def merge_srt_data(sorted_files):
 # KML and ZIP Generation Functions
 # ──────────────────────────────────────────────────────────────────────────
 
-# --- MODIFIED to include credits in description ---
 def kml_style_header(num_styles):
     """Generates KML styles and the main document header with credits."""
     credit_text = (
@@ -266,7 +265,6 @@ def kml_style_header(num_styles):
         )
     return header + "".join(styles)
 
-# --- MODIFIED to add a new 3D path folder ---
 def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_files):
     """Generates one KML file containing all data in organized folders."""
     num_styles = len(srt_files)
@@ -349,9 +347,20 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
     xml.append("</Document></kml>")
     return "\n".join(xml)
 
+# --- CORRECTED FUNCTION to generate progressive timestamps ---
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name):
-    """Creates a single ZIP archive containing all output files."""
+    """Creates a single ZIP archive containing all output files with corrected timestamps."""
     zip_buffer = io.BytesIO()
+
+    def _seconds_to_srt_time(seconds):
+        """Helper to convert seconds to HH:MM:SS,ms format."""
+        millis = int((seconds * 1000) % 1000)
+        total_seconds = int(seconds)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
+
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         # 1. Create and add the single, combined KML
         combined_kml_data = generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_files)
@@ -371,10 +380,19 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         }
 
         for filename, data_col in cols.items():
-            srt_content = "\n\n".join(
-                f"{processed_data[i]['idx']}\n{processed_data[i]['range']}\n{data_col[i]}"
-                for i in range(len(processed_data))
-            )
+            srt_blocks = []
+            # THE FIX IS HERE: We now loop with an index 'i' to create progressive timestamps
+            for i, block_data in enumerate(processed_data):
+                start_time_str = _seconds_to_srt_time(i * 1.0) # Start at second i
+                end_time_str = _seconds_to_srt_time((i + 1) * 1.0) # End at second i+1
+                progressive_time_range = f"{start_time_str} --> {end_time_str}"
+                
+                srt_blocks.append(
+                    f"{block_data['idx']}\n"
+                    f"{progressive_time_range}\n"
+                    f"{data_col[i]}"
+                )
+            srt_content = "\n\n".join(srt_blocks)
             zf.writestr(f"Processed_SRTs/{filename}", srt_content)
             
     zip_buffer.seek(0)
