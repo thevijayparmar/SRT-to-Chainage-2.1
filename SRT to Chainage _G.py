@@ -5,7 +5,7 @@ import re
 import math
 import zipfile
 import io
-import xml.etree.ElementTree as ET
+import xml.et.ElementTree as ET
 from datetime import datetime
 import plotly.graph_objects as go
 import os
@@ -354,7 +354,7 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
 
     def _seconds_to_srt_time(seconds):
         """Helper to convert seconds to HH:MM:SS,ms format."""
-        millis = int((seconds * 1000) % 1000)
+        millis = int(round((seconds * 1000) % 1000))
         total_seconds = int(seconds)
         hours = total_seconds // 3600
         minutes = (total_seconds % 3600) // 60
@@ -379,12 +379,18 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
             f"{prefix}_08_Date.srt": [b['date'] for b in processed_data],
         }
 
+        # This interval matches the standard drone recording frequency (~30 fps)
+        interval_seconds = 0.0333
+
         for filename, data_col in cols.items():
             srt_blocks = []
-            # THE FIX IS HERE: We now loop with an index 'i' to create progressive timestamps
+            # THE FIX IS HERE: Loop with 'i' to create progressive timestamps based on a realistic interval
             for i, block_data in enumerate(processed_data):
-                start_time_str = _seconds_to_srt_time(i * 1.0) # Start at second i
-                end_time_str = _seconds_to_srt_time((i + 1) * 1.0) # End at second i+1
+                start_time_sec = i * interval_seconds
+                end_time_sec = (i + 1) * interval_seconds
+                
+                start_time_str = _seconds_to_srt_time(start_time_sec)
+                end_time_str = _seconds_to_srt_time(end_time_sec)
                 progressive_time_range = f"{start_time_str} --> {end_time_str}"
                 
                 srt_blocks.append(
