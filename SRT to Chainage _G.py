@@ -7,9 +7,10 @@ import zipfile
 import io
 # --- MODIFIED: Switched to a more robust XML parser to resolve the error ---
 from lxml import etree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 import plotly.graph_objects as go
 import os
+import pandas as pd
 
 # --- ADDED FOR HIGH-ACCURACY CALCULATIONS ---
 from pyproj import Geod
@@ -52,6 +53,14 @@ if 'srt_files' not in st.session_state:
 # ──────────────────────────────────────────────────────────────────────────
 # Geospatial & Core Logic Helper Functions
 # ──────────────────────────────────────────────────────────────────────────
+
+def format_timedelta(td: timedelta) -> str:
+    """Formats a timedelta object into HH:MM:SS."""
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 # --- MODIFIED FOR HIGH ACCURACY ---
 def calculate_cumulative_dist(coords, offset=0.0):
@@ -152,18 +161,14 @@ def project_point_to_polyline(point, polyline_coords, polyline_chainage):
 # File Parsing and Data Handling Functions
 # ──────────────────────────────────────────────────────────────────────────
 
-# --- MODIFIED to use lxml for robustness ---
 @st.cache_data
 def parse_kml_2d(uploaded_file):
     """Parses a KML file to extract the first LineString coordinates."""
     ns = {'kml': 'http://www.opengis.net/kml/2.2'}
     file_content = uploaded_file.getvalue()
-    # Reset buffer position for potential reuse
     uploaded_file.seek(0)
-    # Using lxml's parser which is more robust
     tree = ET.parse(io.BytesIO(file_content))
     
-    # lxml uses the 'namespaces' keyword argument for find
     coord_element = tree.find('.//kml:LineString/kml:coordinates', namespaces=ns)
     if coord_element is None:
         st.error("Could not find a LineString in the KML file.")
@@ -176,32 +181,35 @@ def parse_kml_2d(uploaded_file):
                 lon, lat, *_ = part.split(',')
                 coords.append((float(lat), float(lon)))
             except ValueError:
-                continue # Skip malformed coordinate pairs
+                continue
     return coords
 
-# --- CORRECTED to handle both comma and dot for milliseconds ---
 @st.cache_data
-def get_srt_start_time(uploaded_file):
-    """Efficiently reads the first timestamp from an SRT file."""
+def get_srt_file_info(uploaded_file):
+    """Efficiently reads an SRT file to get its start time and duration."""
     try:
         content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
-        uploaded_file.seek(0) # Reset buffer
-        match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", content)
-        if match:
-            # Normalize comma to dot for strptime
-            time_str = match.group(1).replace(',', '.')
-            return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
-    except Exception:
-        return None
-    return None
+        uploaded_file.seek(0)
+        
+        # Find all timestamps
+        timestamps = re.findall(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", content)
+        if not timestamps:
+            return None, None
 
-# --- CORRECTED for robust and efficient parsing ---
+        # Normalize and convert to datetime objects
+        datetimes = [datetime.strptime(ts.replace(',', '.'), "%Y-%m-%d %H:%M:%S.%f") for ts in timestamps]
+        
+        start_time = min(datetimes) if datetimes else None
+        duration = max(datetimes) - start_time if len(datetimes) > 1 else timedelta(seconds=0)
+        
+        return start_time, duration
+    except Exception:
+        return None, None
+
 def parse_srt(file_content_str, origin_index, start_idx=1):
     """Parses a single SRT file's content, creating full datetime objects."""
     blocks = []
     current_idx = start_idx
-    
-    # Split the file content by the standard SRT block separator
     srt_blocks = file_content_str.strip().split('\n\n')
     
     for block_text in srt_blocks:
@@ -220,7 +228,6 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
         if alt_match: alt = float(alt_match.group(1))
         if time_match:
             try:
-                # Normalize comma to dot for strptime
                 time_str = time_match.group(1).replace(',', '.')
                 datetime_obj = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
             except ValueError:
@@ -344,7 +351,7 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
         xml.append("</Folder>")
     xml.append("</Folder>")
     
-    # --- NEW FOLDER 4: Drone Full Path in 3D ---
+    # --- Folder 4: Drone Full Path in 3D ---
     xml.append("<Folder><name>drone_full_path_3d</name>")
     for i, srt_file in enumerate(srt_files):
         flight_blocks = [b for b in processed_data if b['origin_index'] == i]
@@ -362,7 +369,6 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
     xml.append("</Document></kml>")
     return "\n".join(xml)
 
-# --- CORRECTED to generate progressive timestamps based on real datetime ---
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name):
     """Creates a single ZIP archive with all outputs and correct progressive timestamps."""
     zip_buffer = io.BytesIO()
@@ -472,7 +478,9 @@ if uploaded_kml:
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             total_length = calculate_cumulative_dist(kml_coords)[-1]
 
-            st.info(f"**Total Alignment Length:** `{total_length:.3f} km`")
+            # --- MODIFIED to show big text ---
+            st.metric(label="Total Alignment Length", value=f"{total_length:.3f} km")
+            st.markdown("---") # Visual separator
 
             c1, c2, c3 = st.columns([2, 2, 1])
             c1.metric("Current Start Point", f"{kml_coords[0][0]:.6f}, {kml_coords[0][1]:.6f}")
@@ -494,10 +502,16 @@ if uploaded_srts:
     previous_filenames = sorted([f.name for f in st.session_state.get('srt_files_cache', [])])
 
     if current_filenames != previous_filenames:
-        with st.spinner("Analyzing SRT start times..."):
+        with st.spinner("Analyzing SRT files..."):
+            file_infos = []
+            for f in uploaded_srts:
+                start_time, duration = get_srt_file_info(f)
+                file_infos.append({"file": f, "start_time": start_time, "duration": duration})
+            
+            # Sort by start time
             st.session_state.srt_files = sorted(
-                uploaded_srts,
-                key=lambda f: get_srt_start_time(f) or datetime.max
+                file_infos,
+                key=lambda x: x["start_time"] or datetime.max
             )
         st.session_state.srt_files_cache = uploaded_srts.copy()
 
@@ -506,22 +520,26 @@ if uploaded_srts:
             st.subheader("SRT File Processing Order")
             st.caption("Files are sorted chronologically by default. You can reorder them for processing.")
 
-            for i, f in enumerate(st.session_state.srt_files):
-                cols = st.columns([1, 8, 1, 1])
+            for i, info in enumerate(st.session_state.srt_files):
+                f = info["file"]
+                duration_str = format_timedelta(info["duration"]) if info["duration"] else "N/A"
+                
+                cols = st.columns([1, 8, 3, 1, 1])
                 cols[0].write(f"**{i+1}.**")
                 cols[1].write(f.name)
-                if cols[2].button("⬆️", key=f"up_{i}", help="Move Up", disabled=(i == 0)):
+                cols[2].write(f"_(Duration: {duration_str})_")
+                if cols[3].button("⬆️", key=f"up_{i}", help="Move Up", disabled=(i == 0)):
                     st.session_state.srt_files.insert(i-1, st.session_state.srt_files.pop(i))
                     st.rerun()
-                if cols[3].button("⬇️", key=f"down_{i}", help="Move Down", disabled=(i == len(st.session_state.srt_files)-1)):
+                if cols[4].button("⬇️", key=f"down_{i}", help="Move Down", disabled=(i == len(st.session_state.srt_files)-1)):
                     st.session_state.srt_files.insert(i+1, st.session_state.srt_files.pop(i))
                     st.rerun()
             
             if st.button("Reset to Chronological Order"):
                  with st.spinner("Re-sorting files..."):
                     st.session_state.srt_files = sorted(
-                        uploaded_srts,
-                        key=lambda f: get_srt_start_time(f) or datetime.max
+                        st.session_state.srt_files,
+                        key=lambda x: x["start_time"] or datetime.max
                     )
                  st.rerun()
 
@@ -540,7 +558,9 @@ if st.session_state.kml_data.get("coords") and st.session_state.srt_files:
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             kml_chainage = calculate_cumulative_dist(kml_coords, st.session_state.chain_offset)
             
-            merged_srt_data = merge_srt_data(st.session_state.srt_files)
+            # Use the file objects from the session state
+            files_to_merge = [info['file'] for info in st.session_state.srt_files]
+            merged_srt_data = merge_srt_data(files_to_merge)
 
             processed_data = []
             for block in merged_srt_data:
@@ -572,13 +592,13 @@ if 'processed_data' in st.session_state:
         start_ch = processed_data[0]['chainage']
         end_ch = processed_data[-1]['chainage']
         
-        drone_path_coords = [(b['lat'], b['lon']) for b in processed_data]
-        total_flight_dist_km = calculate_cumulative_dist(drone_path_coords)[-1]
+        # Calculate total flight duration
+        total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
         
         sc1, sc2, sc3 = st.columns(3)
         sc1.metric("Merged SRT Start Chainage", f"{start_ch:.3f} km")
         sc2.metric("Merged SRT End Chainage", f"{end_ch:.3f} km")
-        sc3.metric("Total Drone Flight Distance", f"{total_flight_dist_km * 1000:.1f} m")
+        sc3.metric("Total Merged Flight Duration", format_timedelta(total_duration))
 
     # --- 3D Visualization ---
     with st.container(border=True):
@@ -590,7 +610,8 @@ if 'processed_data' in st.session_state:
             mode='lines', line=dict(color='blue', width=10), name='KML Alignment'
         ))
         
-        for i, srt_file in enumerate(st.session_state.srt_files):
+        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+        for i, srt_file in enumerate(srt_file_objects):
             flight_blocks = [b for b in processed_data if b['origin_index'] == i]
             if not flight_blocks: continue
             fig.add_trace(go.Scatter3d(
@@ -621,6 +642,47 @@ if 'processed_data' in st.session_state:
         )
         st.plotly_chart(fig, use_container_width=True)
 
+    # --- NEW: 2D Map Visualization ---
+    with st.container(border=True):
+        st.subheader("🌍 2D Map Visualization")
+        
+        df = pd.DataFrame(processed_data)
+        
+        map_fig = go.Figure()
+
+        # Add KML Alignment
+        map_fig.add_trace(go.Scattermapbox(
+            mode="lines",
+            lon=[c[1] for c in kml_coords],
+            lat=[c[0] for c in kml_coords],
+            marker={'color': 'blue', 'size': 10},
+            name="KML Alignment"
+        ))
+
+        # Add Drone Flights
+        srt_file_objects = [info['file'] for info in st.session_state.srt_files]
+        for i, srt_file in enumerate(srt_file_objects):
+            flight_df = df[df['origin_index'] == i]
+            if flight_df.empty: continue
+            map_fig.add_trace(go.Scattermapbox(
+                mode="lines",
+                lon=flight_df['lon'],
+                lat=flight_df['lat'],
+                marker={'color': PLOTLY_COLORS[i % len(PLOTLY_COLORS)]},
+                name=f'Flight: {srt_file.name}'
+            ))
+            
+        map_fig.update_layout(
+            mapbox_style="open-street-map",
+            mapbox_zoom=10,
+            mapbox_center_lat=df['lat'].mean(),
+            mapbox_center_lon=df['lon'].mean(),
+            margin={"r":0,"t":0,"l":0,"b":0},
+            height=600,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(map_fig, use_container_width=True)
+
     # --- SINGLE DATA EXPORT BUTTON ---
     with st.container(border=True):
         st.subheader("📁 Data Export")
@@ -630,7 +692,7 @@ if 'processed_data' in st.session_state:
             processed_data,
             kml_coords,
             st.session_state.kml_chainage_map,
-            st.session_state.srt_files,
+            [info['file'] for info in st.session_state.srt_files],
             st.session_state.kml_data["name"]
         )
         
