@@ -174,50 +174,50 @@ def parse_kml_2d(uploaded_file):
             continue # Skip malformed coordinate pairs
     return coords
 
+# --- CORRECTED to handle both comma and dot for milliseconds ---
 @st.cache_data
 def get_srt_start_time(uploaded_file):
     """Efficiently reads the first timestamp from an SRT file."""
     try:
         content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
         uploaded_file.seek(0) # Reset buffer
-        # This regex now correctly handles milliseconds
         match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", content)
         if match:
-            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f")
+            # Normalize comma to dot for strptime
+            time_str = match.group(1).replace(',', '.')
+            return datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
     except Exception:
         return None
     return None
 
-# --- CORRECTED to handle full datetime objects ---
+# --- CORRECTED for robust and efficient parsing ---
 def parse_srt(file_content_str, origin_index, start_idx=1):
     """Parses a single SRT file's content, creating full datetime objects."""
-    lines = file_content_str.splitlines()
-    blocks, i = [], 0
+    blocks = []
     current_idx = start_idx
     
-    while i < len(lines):
-        if not lines[i].strip().isdigit():
-            i += 1
+    # Split the file content by the standard SRT block separator
+    srt_blocks = file_content_str.strip().split('\n\n')
+    
+    for block_text in srt_blocks:
+        if not block_text.strip():
             continue
-        
-        original_idx = int(lines[i].strip())
-        time_range = lines[i+1].strip()
-        j = i + 2
+            
         lat, lon, alt, datetime_obj = None, None, 0.0, None
         
-        text_block = "\n".join(lines[j:])
-        
-        lat_match = re.search(r"\[latitude:\s*([0-9.\-]+)", text_block)
-        lon_match = re.search(r"\[longitude:\s*([0-9.\-]+)", text_block)
-        alt_match = re.search(r"\[altitude:\s*([0-9.\-]+)", text_block)
-        time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", text_block)
+        lat_match = re.search(r"\[latitude:\s*([0-9.\-]+)", block_text)
+        lon_match = re.search(r"\[longitude:\s*([0-9.\-]+)", block_text)
+        alt_match = re.search(r"\[altitude:\s*([0-9.\-]+)", block_text)
+        time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", block_text)
 
         if lat_match: lat = float(lat_match.group(1))
         if lon_match: lon = float(lon_match.group(1))
         if alt_match: alt = float(alt_match.group(1))
         if time_match:
             try:
-                datetime_obj = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S.%f")
+                # Normalize comma to dot for strptime
+                time_str = time_match.group(1).replace(',', '.')
+                datetime_obj = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
             except ValueError:
                 datetime_obj = None
 
@@ -231,13 +231,6 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
                 'origin_index': origin_index
             })
             current_idx += 1
-        
-        # Move to the start of the next block
-        next_block_start = file_content_str.find(f"\n\n{original_idx+2}\n", i)
-        if next_block_start != -1:
-            i = next_block_start
-        else:
-            break # End of file
             
     return blocks
 
@@ -386,7 +379,6 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
 
         # 2. Prepare data columns for SRT files
         prefix = os.path.splitext(kml_name)[0]
-        # We get the datetime_obj to create the Timer and Date files
         datetime_objs = [b['datetime_obj'] for b in processed_data]
         cols = {
             f"{prefix}_01_Latitude.srt": [f"{b['lat']:.7f}" for b in processed_data],
@@ -405,10 +397,8 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         for filename, data_col in cols.items():
             srt_blocks = []
             for i, block_data in enumerate(processed_data):
-                # THE FIX: Calculate time delta from the absolute start
                 delta = block_data['datetime_obj'] - start_datetime
                 start_time_sec = delta.total_seconds()
-                # Use a small, consistent duration for each subtitle frame
                 end_time_sec = start_time_sec + 0.033
 
                 start_time_str = _seconds_to_srt_time(start_time_sec)
