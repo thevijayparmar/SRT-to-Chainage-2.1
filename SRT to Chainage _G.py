@@ -5,7 +5,7 @@ import re
 import math
 import zipfile
 import io
-# --- MODIFIED: Switched to a more robust XML parser ---
+# --- MODIFIED: Switched to a more robust XML parser to resolve the error ---
 from lxml import etree as ET
 from datetime import datetime
 import plotly.graph_objects as go
