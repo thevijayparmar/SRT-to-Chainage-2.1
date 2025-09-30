@@ -180,15 +180,17 @@ def get_srt_start_time(uploaded_file):
     try:
         content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
         uploaded_file.seek(0) # Reset buffer
-        match = re.search(r"(\d{4}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2})", content)
+        # This regex now correctly handles milliseconds
+        match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", content)
         if match:
-            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+            return datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S.%f")
     except Exception:
         return None
     return None
 
+# --- CORRECTED to handle full datetime objects ---
 def parse_srt(file_content_str, origin_index, start_idx=1):
-    """Parses a single SRT file's content into a list of data blocks."""
+    """Parses a single SRT file's content, creating full datetime objects."""
     lines = file_content_str.splitlines()
     blocks, i = [], 0
     current_idx = start_idx
@@ -201,25 +203,42 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
         original_idx = int(lines[i].strip())
         time_range = lines[i+1].strip()
         j = i + 2
-        lat, lon, alt, tim, date_str = None, None, 0.0, "", ""
+        lat, lon, alt, datetime_obj = None, None, 0.0, None
         
-        while j < len(lines) and lines[j].strip():
-            line = lines[j]
-            if m := re.search(r"\[latitude:\s*([0-9.\-]+)", line): lat = float(m.group(1))
-            if m := re.search(r"\[longitude:\s*([0-9.\-]+)", line): lon = float(m.group(1))
-            if m := re.search(r"\[altitude:\s*([0-9.\-]+)", line): alt = float(m.group(1))
-            if m := re.search(r"(\d{4}-\d{2}-\d{2})\s*([0-9:]{8})", line):
-                date_str = m.group(1)
-                tim = m.group(2)
-            j += 1
-            
-        if lat is not None and lon is not None:
+        text_block = "\n".join(lines[j:])
+        
+        lat_match = re.search(r"\[latitude:\s*([0-9.\-]+)", text_block)
+        lon_match = re.search(r"\[longitude:\s*([0-9.\-]+)", text_block)
+        alt_match = re.search(r"\[altitude:\s*([0-9.\-]+)", text_block)
+        time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}[.,]\d{3})", text_block)
+
+        if lat_match: lat = float(lat_match.group(1))
+        if lon_match: lon = float(lon_match.group(1))
+        if alt_match: alt = float(alt_match.group(1))
+        if time_match:
+            try:
+                datetime_obj = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S.%f")
+            except ValueError:
+                datetime_obj = None
+
+        if lat is not None and lon is not None and datetime_obj is not None:
             blocks.append({
-                'idx': current_idx, 'range': time_range, 'lat': lat, 'lon': lon,
-                'alt': alt, 'tim': tim, 'date': date_str, 'origin_index': origin_index
+                'idx': current_idx, 
+                'lat': lat, 
+                'lon': lon,
+                'alt': alt, 
+                'datetime_obj': datetime_obj, 
+                'origin_index': origin_index
             })
             current_idx += 1
-        i = j + 1
+        
+        # Move to the start of the next block
+        next_block_start = file_content_str.find(f"\n\n{original_idx+2}\n", i)
+        if next_block_start != -1:
+            i = next_block_start
+        else:
+            break # End of file
+            
     return blocks
 
 def merge_srt_data(sorted_files):
@@ -318,7 +337,6 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
         
         xml.append(f"<Folder><name>{file_name}</name>")
         xml.append(f"<Placemark><name>Route</name><styleUrl>#srtStyle_{i}</styleUrl><LineString><tessellate>1</tessellate><coordinates>")
-        # Using projected coordinates for this folder, but at drone altitude for context
         for b in flight_blocks:
             proj_lat, proj_lon = b['proj_coords']
             xml.append(f"{proj_lon:.7f},{proj_lat:.7f},{b['alt']:.2f}")
@@ -339,7 +357,6 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
         xml.append("<extrude>1</extrude><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode>")
         xml.append("<coordinates>")
         for b in flight_blocks:
-            # Using original drone coordinates for the true 3D path
             xml.append(f"{b['lon']:.7f},{b['lat']:.7f},{b['alt']:.2f}")
         xml.append("</coordinates></LineString></Placemark>")
     xml.append("</Folder>")
@@ -347,13 +364,14 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
     xml.append("</Document></kml>")
     return "\n".join(xml)
 
-# --- CORRECTED FUNCTION to generate progressive timestamps ---
+# --- CORRECTED to generate progressive timestamps based on real datetime ---
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name):
-    """Creates a single ZIP archive containing all output files with corrected timestamps."""
+    """Creates a single ZIP archive with all outputs and correct progressive timestamps."""
     zip_buffer = io.BytesIO()
 
     def _seconds_to_srt_time(seconds):
-        """Helper to convert seconds to HH:MM:SS,ms format."""
+        """Helper to convert total seconds to HH:MM:SS,ms format."""
+        if seconds < 0: seconds = 0
         millis = int(round((seconds * 1000) % 1000))
         total_seconds = int(seconds)
         hours = total_seconds // 3600
@@ -366,29 +384,33 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         combined_kml_data = generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_files)
         zf.writestr("All_Outputs.kml", combined_kml_data)
 
-        # 2. Add the eight processed SRT files to a subfolder
+        # 2. Prepare data columns for SRT files
         prefix = os.path.splitext(kml_name)[0]
+        # We get the datetime_obj to create the Timer and Date files
+        datetime_objs = [b['datetime_obj'] for b in processed_data]
         cols = {
             f"{prefix}_01_Latitude.srt": [f"{b['lat']:.7f}" for b in processed_data],
             f"{prefix}_02_Longitude.srt": [f"{b['lon']:.7f}" for b in processed_data],
             f"{prefix}_03_Altitude.srt": [f"{b['alt']:.2f}" for b in processed_data],
-            f"{prefix}_04_Timer.srt": [b['tim'] for b in processed_data],
+            f"{prefix}_04_Timer.srt": [dt.strftime('%H:%M:%S') for dt in datetime_objs],
             f"{prefix}_05_LatLonOutput.srt": [f"{b['lat']:.7f}, {b['lon']:.7f}" for b in processed_data],
             f"{prefix}_06_Chainage.srt": [f"{b['chainage']:.3f} km" for b in processed_data],
             f"{prefix}_07_Lateral_Offset.srt": [f"{b['offset']:.3f} m" for b in processed_data],
-            f"{prefix}_08_Date.srt": [b['date'] for b in processed_data],
+            f"{prefix}_08_Date.srt": [dt.strftime('%Y-%m-%d') for dt in datetime_objs],
         }
 
-        # This interval matches the standard drone recording frequency (~30 fps)
-        interval_seconds = 0.0333
-
+        # 3. Create progressive timestamps
+        start_datetime = processed_data[0]['datetime_obj'] if processed_data else datetime.now()
+        
         for filename, data_col in cols.items():
             srt_blocks = []
-            # THE FIX IS HERE: Loop with 'i' to create progressive timestamps based on a realistic interval
             for i, block_data in enumerate(processed_data):
-                start_time_sec = i * interval_seconds
-                end_time_sec = (i + 1) * interval_seconds
-                
+                # THE FIX: Calculate time delta from the absolute start
+                delta = block_data['datetime_obj'] - start_datetime
+                start_time_sec = delta.total_seconds()
+                # Use a small, consistent duration for each subtitle frame
+                end_time_sec = start_time_sec + 0.033
+
                 start_time_str = _seconds_to_srt_time(start_time_sec)
                 end_time_str = _seconds_to_srt_time(end_time_sec)
                 progressive_time_range = f"{start_time_str} --> {end_time_str}"
