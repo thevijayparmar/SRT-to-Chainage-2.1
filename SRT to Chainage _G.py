@@ -111,6 +111,54 @@ def project_point_to_polyline(point, polyline_coords, polyline_chainage):
     projected_chainage = polyline_chainage[best_segment_idx] + (dist_along_segment_m / 1000.0)
     return projected_chainage, best_proj_point, offset_dist_m
 
+# --- NEW FUNCTION TO FIX TIMELINE ---
+def calculate_continuous_timeline(processed_data):
+    """
+    Processes data to add a 'continuous_delta' timedelta object for each entry,
+    removing gaps between flights for accurate SRT/video timeline generation.
+    Also returns the true total flight duration.
+    """
+    if not processed_data:
+        return [], timedelta(0)
+
+    # Group data by original file index
+    flights = {}
+    for block in processed_data:
+        idx = block['origin_index']
+        if idx not in flights:
+            flights[idx] = []
+        flights[idx].append(block)
+
+    cumulative_duration = timedelta(0)
+    total_flight_duration = timedelta(0)
+    
+    # Sort flights by their first timestamp to ensure chronological processing
+    sorted_flight_indices = sorted(flights.keys(), key=lambda k: flights[k][0]['datetime_obj'])
+
+    for idx in sorted_flight_indices:
+        flight_blocks = flights[idx]
+        if not flight_blocks:
+            continue
+        
+        flight_start_time = flight_blocks[0]['datetime_obj']
+        flight_end_time = flight_blocks[-1]['datetime_obj']
+        
+        # Calculate the duration of this specific flight and add to total
+        # We add the duration of one frame to the end time to capture the full length
+        frame_duration = timedelta(seconds=0.04) # Assuming ~25fps, a safe small value
+        flight_duration = (flight_end_time - flight_start_time) + frame_duration
+        total_flight_duration += flight_duration
+
+        # Assign continuous delta to each block
+        for block in flight_blocks:
+            time_into_flight = block['datetime_obj'] - flight_start_time
+            block['continuous_delta'] = cumulative_duration + time_into_flight
+            
+        # Add this flight's duration to the cumulative total for the next flight
+        cumulative_duration += flight_duration
+        
+    return processed_data, total_flight_duration
+
 # ──────────────────────────────────────────────────────────────────────────
 # File Parsing Functions
 # ──────────────────────────────────────────────────────────────────────────
@@ -257,7 +305,6 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
 
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name, thin_rate=None):
     """Creates a single ZIP archive with thinned SRTs and a combined KML."""
-    # This function now also handles thinning
     zip_buffer = io.BytesIO()
 
     def _seconds_to_srt_time(seconds):
@@ -269,7 +316,6 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         secs = total_seconds % 60
         return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
-    # Thin the data if a rate is specified
     if thin_rate and thin_rate > 0:
         interval = timedelta(seconds=1.0/thin_rate)
         thinned_data = []
@@ -299,13 +345,16 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
             f"{prefix}_08_Date.srt": [dt.strftime('%Y-%m-%d') for dt in datetime_objs],
         }
 
-        start_datetime = data_to_process[0]['datetime_obj'] if data_to_process else datetime.now()
+        # --- MODIFICATION: The start_datetime anchor is no longer needed ---
+        # start_datetime = data_to_process[0]['datetime_obj'] if data_to_process else datetime.now()
         
         for filename, data_col in cols.items():
             srt_blocks = []
             for i, block_data in enumerate(data_to_process):
-                delta = block_data['datetime_obj'] - start_datetime
+                # --- MODIFICATION: Use the pre-calculated continuous delta ---
+                delta = block_data['continuous_delta']
                 start_time_sec = delta.total_seconds()
+                
                 # Use a small, consistent duration for each subtitle frame
                 end_time_sec = start_time_sec + (1.0 / thin_rate if thin_rate else 0.033)
 
@@ -525,33 +574,26 @@ else:
             files_to_merge = [info['file'] for info in st.session_state.srt_files]
             merged_srt_data = merge_srt_data(files_to_merge)
             
-            processed_data = []
+            processed_data_temp = []
             total_points = len(merged_srt_data)
+            progress_placeholder = st.empty()
 
-            # --- NEW: Arcade Progress Bar ---
             if total_points > 0:
-                progress_placeholder = st.empty()
-                
                 # Arcade animation setup
-                width = 50 # Width of the progress bar area
+                width = 50 
                 sky_height = 5
                 sky = [[' ' for _ in range(width)] for _ in range(sky_height)]
-                bullets = [] # (y, x)
+                bullets = [] 
                 
                 for i, block in enumerate(merged_srt_data):
                     point = (block['lat'], block['lon'])
                     chainage, proj_coords, offset = project_point_to_polyline(point, kml_coords, kml_chainage)
                     block.update({'chainage': chainage, 'proj_coords': proj_coords, 'offset': offset})
-                    processed_data.append(block)
+                    processed_data_temp.append(block)
                     
-                    # Update animation periodically
                     if i % 25 == 0 or i == total_points - 1:
                         progress = (i + 1) / total_points
-                        
-                        # Tank position
                         tank_pos = int(progress * (width - 3))
-                        
-                        # Bullets
                         bullets.append([sky_height - 1, tank_pos + 1])
                         new_bullets = []
                         for b in bullets:
@@ -559,15 +601,11 @@ else:
                                 b[0] -= 1
                                 new_bullets.append(b)
                         bullets = new_bullets
-
-                        # Sky objects
                         for y in range(sky_height - 1, 0, -1):
                             sky[y] = sky[y-1]
                         sky[0] = [' ' for _ in range(width)]
-                        if random.random() < 0.3: # Chance to spawn a new object
+                        if random.random() < 0.3:
                             sky[0][random.randint(0, width - 1)] = random.choice(['🎈', '💣', '🪨', '⭐'])
-                        
-                        # Collision
                         for y, row in enumerate(sky):
                             for x, cell in enumerate(row):
                                 if cell in ['🎈', '💣', '🪨', '⭐']:
@@ -576,26 +614,22 @@ else:
                                             sky[y][x] = random.choice(['✨', '💥', '💨', '🔥'])
                                             bullets.pop(b_idx)
                                             break
-                        
-                        # Draw sky with bullets
                         display_sky = [row[:] for row in sky]
                         for r, c in bullets:
                             if 0 <= r < sky_height and 0 <= c < width:
                                 display_sky[r][c] = random.choice(['|', '🚀', '⚡'])
-                        
                         sky_str = "\n".join("".join(row) for row in display_sky)
-
                         bar = '█' * tank_pos + '🚚' + '─' * (width - tank_pos - 3)
-                        
-                        progress_placeholder.code(
-                            f"{sky_str}\n"
-                            f"[{bar}]\n"
-                            f"Processing: {i+1} / {total_points}",
-                            language=None
-                        )
+                        progress_placeholder.code(f"{sky_str}\n[{bar}]\nProcessing: {i+1} / {total_points}", language=None)
                         time.sleep(0.01)
 
+            # --- MODIFICATION: Call the new function to fix the timeline ---
+            processed_data, true_total_duration = calculate_continuous_timeline(processed_data_temp)
+            
             st.session_state.processed_data = processed_data
+            st.session_state.true_total_duration = true_total_duration # Save the true duration
+            # --- END MODIFICATION ---
+
             st.session_state.kml_chainage_map = kml_chainage
             st.session_state.final_kml_coords = kml_coords
             st.session_state.thin_rate = thin_rate if use_thinning else None
@@ -619,12 +653,17 @@ if 'processed_data' in st.session_state:
             st.subheader("📊 Summary Statistics")
             start_ch = processed_data[0]['chainage']
             end_ch = processed_data[-1]['chainage']
-            total_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
             
-            sc1, sc2, sc3 = st.columns(3)
+            # --- MODIFICATION: Display correct cumulative time and old clock time ---
+            clock_time_duration = processed_data[-1]['datetime_obj'] - processed_data[0]['datetime_obj']
+            true_duration = st.session_state.get('true_total_duration', timedelta(0))
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
             sc1.metric("Merged SRT Start Chainage", f"**{start_ch:.3f} km**")
             sc2.metric("Merged SRT End Chainage", f"**{end_ch:.3f} km**")
-            sc3.metric("Total Merged Flight Duration", f"**{format_timedelta(total_duration)}**")
+            sc3.metric("✅ Total Flight Time (Cumulative)", f"**{format_timedelta(true_duration)}**")
+            sc4.metric("🕒 Total Project Span (Clock Time)", f"**{format_timedelta(clock_time_duration)}**")
+            # --- END MODIFICATION ---
 
         with st.container(border=True):
             st.subheader("🗺️ 3D Visualization")
@@ -681,4 +720,3 @@ if 'processed_data' in st.session_state and st.session_state.processed_data:
                     video_zip_buffer = generate_video_clips_zip(st.session_state.processed_data, st.session_state.kml_data["name"], width=vid_width, font_color=font_color, bg_color=bg_color, fps=vid_fps, thin_rate=st.session_state.get('thin_rate'))
                 if video_zip_buffer:
                     st.download_button(label="⬇️ **Download All Video Clips (.zip)**", data=video_zip_buffer, file_name="SRT_Video_Clips.zip", mime="application/zip", use_container_width=True, type="primary")
-
