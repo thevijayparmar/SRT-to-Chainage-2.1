@@ -5,7 +5,6 @@ import re
 import math
 import zipfile
 import io
-# Using lxml for robust KML parsing
 from lxml import etree as ET
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
@@ -20,34 +19,34 @@ import random
 try:
     from moviepy.editor import ImageSequenceClip
     MOVIEPY_AVAILABLE = True
-except ImportError:
+except Exception:
     MOVIEPY_AVAILABLE = False
 
-# High-accuracy calculations
+# High-accuracy geodesic
 from pyproj import Geod
 
 st.set_page_config(page_title="Drone SRT & Chainage v3.0", layout="wide")
 
-# Colors
+# Plot colors
 PLOTLY_COLORS = [
-    '#FF0000', '#FFA500', '#008000', '#0000FF', '#4B0082', '#EE82EE', 
+    '#FF0000', '#FFA500', '#008000', '#0000FF', '#4B0082', '#EE82EE',
     '#A52A2A', '#00FFFF', '#FF00FF', '#808080'
 ]
 
-# Session init
+# Session defaults
 if 'kml_data' not in st.session_state:
     st.session_state.kml_data = {"name": None, "coords": None, "swapped": False}
 if 'srt_files' not in st.session_state:
     st.session_state.srt_files = []
 
 # -------------------------
-# Utility: timestamp normalizer
+# Helper: timestamp normalizer
 # -------------------------
 def _normalize_fractional_ts(match):
-    """Converts group fractions like '121,982' or '121' => '.121982' microseconds (6 digits)."""
+    """Convert groups like '121,982' or '121' to microsecond string '.121982' (6 digits)."""
     base = match.group(1)  # YYYY-MM-DD HH:MM:SS
     frac = match.group(2) or "0"
-    frac_digits = re.sub(r"\D", "", frac)  # remove any non-digits (commas)
+    frac_digits = re.sub(r"\D", "", frac)  # remove commas
     frac_digits = (frac_digits + "000000")[:6]
     return f"{base}.{frac_digits}"
 
@@ -55,7 +54,7 @@ def _normalize_fractional_ts(match):
 # SRT format checker & fixer (in-memory)
 # -------------------------
 def is_srt_format_ok(text: str) -> bool:
-    """Quick heuristic: checks for at least one timestamp and lat+lon fields."""
+    """Heuristic: does text contain timestamp + latitude + longitude/longtitude?"""
     if not text:
         return False
     has_time = bool(re.search(r"\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}", text))
@@ -64,54 +63,52 @@ def is_srt_format_ok(text: str) -> bool:
     return has_time and has_lat and has_lon
 
 def fix_srt_bytes(raw_bytes: bytes) -> bytes:
-    """Return fixed SRT bytes: fix longtitude -> longitude, bracket spacing, timestamps."""
+    """Attempt to normalize common differences so the parser will accept the SRT."""
     text = raw_bytes.decode('utf-8', errors='ignore')
 
-    # 1) Fix common typo
+    # 1) common typo
     text = text.replace("longtitude", "longitude")
 
-    # 2) Normalize bracket spacing: [latitude : 34.5] -> [latitude: 34.5]
-    text = re.sub(r'\[\s*([a-zA-Z0-9_]+)\s*:\s*', r'[\1: ', text)
+    # 2) normalize spacing in bracket metadata: [latitude : 34.5] -> [latitude: 34.5]
+    text = re.sub(r'\[\s*([A-Za-z0-9_]+)\s*:\s*', r'[\1: ', text)
 
-    # 3) Normalize timestamps like 2024-10-19 09:37:15,121,982 -> 2024-10-19 09:37:15.121982
-    text = re.sub(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(?:[.,]([\d,]+))?', lambda m: _normalize_fractional_ts(m), text)
+    # 3) normalize timestamps: 2024-10-19 09:37:15,121,982 -> 2024-10-19 09:37:15.121982
+    text = re.sub(
+        r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2})(?:[.,]([\d,]+))?',
+        lambda m: _normalize_fractional_ts(m),
+        text
+    )
 
     return text.encode('utf-8')
 
 # -------------------------
 # KML parsing + validation
 # -------------------------
-@st.cache_data
 def parse_kml_2d(uploaded_file):
-    """Parses a KML and returns coordinates list of (lat, lon) or empty list on failure.
-       Also performs basic validation: expects at least one LineString; if multiple, returns first but caller will warn.
-    """
+    """Parses a KML file to extract the first LineString coordinates as [(lat, lon), ...]."""
     try:
         file_content = uploaded_file.getvalue()
         uploaded_file.seek(0)
         tree = ET.parse(io.BytesIO(file_content))
         ns = {'kml': 'http://www.opengis.net/kml/2.2'}
 
-        # gather all LineString nodes
+        # Try LineString first
         line_elems = tree.findall('.//kml:LineString', namespaces=ns)
 
         if not line_elems:
-            # Try checking for coordinates directly under possible tags (some KML variants)
+            # fallback to any coordinates element
             coord_elements = tree.findall('.//kml:coordinates', namespaces=ns)
             if not coord_elements:
-                return []  # nothing useful
-            # fallback: use the first coordinates element
+                return []
             coord_element = coord_elements[0]
         else:
             coord_element = line_elems[0].find('kml:coordinates', namespaces=ns)
             if coord_element is None:
-                # If LineString has no coordinates text, fallback to any coordinates
                 coord_elements = tree.findall('.//kml:coordinates', namespaces=ns)
                 coord_element = coord_elements[0] if coord_elements else None
                 if coord_element is None:
                     return []
 
-        # Parse coordinates text
         coords = []
         if coord_element is None or coord_element.text is None:
             return []
@@ -121,15 +118,12 @@ def parse_kml_2d(uploaded_file):
                 coords.append((float(lat), float(lon)))
             except Exception:
                 continue
-
         return coords
     except Exception:
         return []
 
 def validate_kml_and_report(uploaded_file):
-    """Validates KML: returns (coords, warnings_list).
-       Warnings list is empty when OK. If multiple LineStrings found, a warning is returned.
-    """
+    """Validate KML, returning (coords, warnings). Warnings empty => OK."""
     warnings = []
     try:
         file_content = uploaded_file.getvalue()
@@ -138,16 +132,13 @@ def validate_kml_and_report(uploaded_file):
         ns = {'kml': 'http://www.opengis.net/kml/2.2'}
 
         line_elems = tree.findall('.//kml:LineString', namespaces=ns)
-        coords_all = []
 
         if not line_elems:
-            # fallback check: coordinates nodes
             coord_nodes = tree.findall('.//kml:coordinates', namespaces=ns)
             if not coord_nodes:
                 return [], ["No LineString or coordinates found in KML. Please upload a KML containing a single continuous LineString."]
-            # use first coordinates node but warn if there are multiple
             if len(coord_nodes) > 1:
-                warnings.append(f"Multiple coordinate elements found ({len(coord_nodes)}). Using the first one. For best results, provide a clean KML with a single continuous LineString.")
+                warnings.append(f"Multiple <coordinates> elements found ({len(coord_nodes)}). Using the first. Provide a clean KML with a single continuous LineString.")
             coord_elem = coord_nodes[0]
             coords_all = []
             if coord_elem.text:
@@ -161,9 +152,9 @@ def validate_kml_and_report(uploaded_file):
                 return [], ["KML coordinates insufficient (need at least 2 points). Provide a single continuous polyline for chainage calculation."]
             return coords_all, warnings
 
-        # If we have LineString(s)
+        # If LineString(s) present
         if len(line_elems) > 1:
-            warnings.append(f"Found {len(line_elems)} LineString elements. Using the first one. For correct chainage, please upload a KML containing a single continuous LineString (one line).")
+            warnings.append(f"Found {len(line_elems)} LineString elements. Using the first one. For correct chainage, provide a KML with a single continuous LineString (one line).")
         first_ls = line_elems[0]
         coord_elem = first_ls.find('kml:coordinates', namespaces=ns)
         if coord_elem is None or (not coord_elem.text or not coord_elem.text.strip()):
@@ -183,11 +174,10 @@ def validate_kml_and_report(uploaded_file):
         return [], ["Failed to parse KML file. Ensure it is a standard KML (not KMZ) with a single LineString containing coordinates."]
 
 # -------------------------
-# SRT reading / parsing (robust)
+# SRT reading / parsing (no caching — avoids hashing BytesIO)
 # -------------------------
-@st.cache_data
 def get_srt_file_info(uploaded_file):
-    """Reads SRT bytes and extracts earliest timestamp and duration robustly."""
+    """Reads SRT-like bytes and extracts earliest timestamp and duration robustly."""
     try:
         content = uploaded_file.getvalue().decode('utf-8', errors='ignore')
         uploaded_file.seek(0)
@@ -216,10 +206,9 @@ def get_srt_file_info(uploaded_file):
         return None, None
 
 def parse_srt(file_content_str, origin_index, start_idx=1):
-    """Parses SRT content into blocks with lat, lon, alt, and datetime_obj."""
+    """Parses SRT content into blocks (idx, lat, lon, alt, datetime_obj, origin_index)."""
     blocks = []
     current_idx = start_idx
-    # split on blank lines robustly
     srt_blocks = re.split(r'\n\s*\n', file_content_str.strip())
 
     for block_text in srt_blocks:
@@ -230,7 +219,6 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
         alt = 0.0
         datetime_obj = None
 
-        # tolerate spaces and both spellings
         lat_match = re.search(r"\[latitude\s*:\s*([0-9.\-]+)\]", block_text, re.IGNORECASE)
         lon_match = re.search(r"\[(?:longitude|longtitude)\s*:\s*([0-9.\-]+)\]", block_text, re.IGNORECASE)
         alt_match = re.search(r"\[(?:rel_alt|altitude)\s*:\s*([0-9.\-]+)\]", block_text, re.IGNORECASE)
@@ -267,7 +255,7 @@ def parse_srt(file_content_str, origin_index, start_idx=1):
     return blocks
 
 # -------------------------
-# Distance & projection helpers (unchanged)
+# Distance & projection helpers (no caching)
 # -------------------------
 def format_timedelta(td: timedelta) -> str:
     total_seconds = int(td.total_seconds())
@@ -286,8 +274,8 @@ def calculate_cumulative_dist(coords, offset=0.0):
     cum_dist = np.concatenate(([offset], offset + np.cumsum(distances_km)))
     return cum_dist.tolist()
 
-@st.cache_data
 def project_point_to_polyline(point, polyline_coords, polyline_chainage):
+    """Project a (lat, lon) to the polyline and return (chainage_km, proj_point(lat,lon), offset_m)."""
     min_dist_sq = float('inf')
     best_proj_point = None
     best_segment_idx = -1
@@ -319,7 +307,7 @@ def project_point_to_polyline(point, polyline_coords, polyline_chainage):
     return projected_chainage, best_proj_point, offset_dist_m
 
 # -------------------------
-# KML, ZIP, and Video Gen (mostly unchanged)
+# KML & SRT output generation (unchanged)
 # -------------------------
 def kml_style_header(num_styles):
     credit_text = "<![CDATA[# Author: Vijay Parmar<br># Community: BGol Community of Advanced Surveying and GIS Professionals]]>"
@@ -381,6 +369,7 @@ def generate_combined_kml(kml_coords, kml_chainage_map, processed_data, srt_file
 
 def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files, kml_name, thin_rate=None):
     zip_buffer = io.BytesIO()
+
     def _seconds_to_srt_time(seconds):
         if seconds < 0: seconds = 0
         millis = int(round((seconds * 1000) % 1000))
@@ -391,7 +380,7 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         return f"{hours:02}:{minutes:02}:{secs:02},{millis:03}"
 
     if thin_rate and thin_rate > 0:
-        interval = timedelta(seconds=1.0/thin_rate)
+        interval = timedelta(seconds=1.0 / thin_rate)
         thinned_data = []
         last_time = datetime.min
         for block in processed_data:
@@ -420,6 +409,7 @@ def generate_master_zip(processed_data, kml_coords, kml_chainage_map, srt_files,
         }
 
         start_datetime = data_to_process[0]['datetime_obj'] if data_to_process else datetime.now()
+
         for filename, data_col in cols.items():
             srt_blocks = []
             for i, block_data in enumerate(data_to_process):
@@ -443,7 +433,7 @@ def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_col
 
     video_zip_buffer = io.BytesIO()
     if thin_rate and thin_rate > 0:
-        interval = timedelta(seconds=1.0/thin_rate)
+        interval = timedelta(seconds=1.0 / thin_rate)
         thinned_data = []
         last_time = datetime.min
         for block in processed_data:
@@ -496,13 +486,13 @@ def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_col
                     draw = ImageDraw.Draw(img)
                     draw.text(((width - text_width) / 2, 10), text, font=font, fill=font_color)
                     frames.append(np.array(img))
-                
+
                 clip = ImageSequenceClip(frames, fps=fps)
                 with io.BytesIO() as temp_buffer:
                     clip.write_videofile(temp_buffer, codec="libx264", fps=fps, logger=None, preset='ultrafast')
                     temp_buffer.seek(0)
                     zf.writestr(filename, temp_buffer.read())
-                
+
                 progress_bar.progress((i + 1) / num_videos)
 
             except Exception as e:
@@ -518,7 +508,7 @@ def generate_video_clips_zip(processed_data, kml_name, width, font_color, bg_col
     return video_zip_buffer
 
 # -------------------------
-# Streamlit UI
+# UI
 # -------------------------
 st.title("🛰️ Drone SRT & Chainage Workflow v3.0")
 st.markdown(
@@ -537,21 +527,17 @@ with col2:
     st.subheader("Step 2: Upload Drone SRT Files")
     uploaded_srts = st.file_uploader("Upload one or more drone .SRT files", type="srt", accept_multiple_files=True)
 
-# KML handling + validation
+# KML: validate and show hints/warnings
 if uploaded_kml:
-    # validate KML and provide warnings/hints
     coords, kml_warnings = validate_kml_and_report(uploaded_kml)
     if not coords:
-        # show errors/hints
         for w in kml_warnings:
             st.error(w)
-        st.info("KML must contain a single continuous LineString (one polyline). If your KML contains multiple geometries or polygons, please export a clean KML with just the alignment polyline.")
+        st.info("KML must contain a single continuous LineString (one polyline). If your KML contains multiple geometries, export a clean KML with just the alignment polyline.")
         st.session_state.kml_data = {"name": None, "coords": None, "swapped": False}
     else:
-        # if warnings present, show them but allow continuation
         for w in kml_warnings:
             st.warning(w)
-        # store coords
         st.session_state.kml_data = {"name": uploaded_kml.name, "coords": coords, "swapped": False}
 
     if st.session_state.kml_data["coords"]:
@@ -572,22 +558,18 @@ if uploaded_kml:
                 min_value=0.0, step=0.001, format="%.3f", value=0.0
             )
 
-# SRT handling: check and auto-convert if necessary
+# SRT: check + auto-fix in memory, then collect file infos
 if uploaded_srts:
-    # We'll build a list of processed Uploaded-like objects (io.BytesIO with .name)
     processed_files = []
     srt_info_msgs = []
     for f in uploaded_srts:
         raw_bytes = f.getvalue()
-        # quick check
         text = raw_bytes.decode('utf-8', errors='ignore')
         if is_srt_format_ok(text):
-            # good to go
             bio = io.BytesIO(raw_bytes)
             bio.name = f.name
             processed_files.append(bio)
         else:
-            # try to auto-fix
             fixed_bytes = fix_srt_bytes(raw_bytes)
             fixed_text = fixed_bytes.decode('utf-8', errors='ignore')
             if is_srt_format_ok(fixed_text):
@@ -596,13 +578,11 @@ if uploaded_srts:
                 processed_files.append(bio)
                 srt_info_msgs.append(f"Auto-fixed SRT format for `{f.name}` → `{bio.name}`.")
             else:
-                # unable to fix automatically, still include original but warn
                 bio = io.BytesIO(raw_bytes)
                 bio.name = f.name
                 processed_files.append(bio)
                 srt_info_msgs.append(f"Could not auto-fix `{f.name}`. It may not contain expected metadata (latitude/longitude/timestamp). Parser may fail.")
 
-    # show messages to user
     if srt_info_msgs:
         with st.expander("SRT auto-check results"):
             for m in srt_info_msgs:
@@ -611,17 +591,15 @@ if uploaded_srts:
                 else:
                     st.warning(m)
 
-    # prepare srt file info list like before
     file_infos = []
     for bf in processed_files:
-        # create a lightweight object with .name and getvalue() interface
+        bf.seek(0)
         start_time, duration = get_srt_file_info(bf)
         bf.seek(0)
         file_infos.append({"file": bf, "start_time": start_time, "duration": duration})
-    # sort by start_time (None -> very large)
     st.session_state.srt_files = sorted(file_infos, key=lambda x: x["start_time"] or datetime.max)
 
-# UI to display SRT list and allow reorder
+# display SRT list / reorder UI
 if st.session_state.get('srt_files'):
     with st.container(border=True):
         st.subheader("SRT File Processing Order")
@@ -666,22 +644,20 @@ else:
             kml_coords = list(reversed(st.session_state.kml_data["coords"])) if st.session_state.kml_data["swapped"] else st.session_state.kml_data["coords"]
             kml_chainage = calculate_cumulative_dist(kml_coords, st.session_state.chain_offset)
             files_to_merge = [info['file'] for info in st.session_state.srt_files]
-            # Merge: read each file as text and parse blocks
-            all_blocks = []
+
+            # Merge
+            merged_srt_data = []
             start_idx = 1
             for i, bf in enumerate(files_to_merge):
                 bf.seek(0)
                 content = bf.getvalue().decode('utf-8', errors='ignore')
                 blocks = parse_srt(content, origin_index=i, start_idx=start_idx)
-                all_blocks.extend(blocks)
-                start_idx = len(all_blocks) + 1
-
-            merged_srt_data = all_blocks
+                merged_srt_data.extend(blocks)
+                start_idx = len(merged_srt_data) + 1
 
             processed_data = []
             total_points = len(merged_srt_data)
 
-            # Arcade progress & processing
             if total_points > 0:
                 progress_placeholder = st.empty()
                 width = 50
@@ -746,6 +722,7 @@ else:
                 progress_placeholder.empty()
                 st.success("✅ Processing complete!")
 
+# Visualization & Export
 if 'processed_data' in st.session_state:
     if not st.session_state.processed_data:
         st.error(
@@ -802,6 +779,7 @@ if 'processed_data' in st.session_state:
             zip_buffer = generate_master_zip(processed_data, kml_coords, st.session_state.kml_chainage_map, [info['file'] for info in st.session_state.srt_files], st.session_state.kml_data["name"], st.session_state.get('thin_rate'))
             st.download_button(label="⬇️ **Download Standard Outputs (.zip)**", data=zip_buffer, file_name="All_Chainage_Outputs.zip", mime="application/zip", use_container_width=True, type="primary")
 
+# Phase 4: Video (optional)
 if 'processed_data' in st.session_state and st.session_state.processed_data:
     st.markdown("---")
     st.header("Phase 4: Video Clip Export (Optional)")
